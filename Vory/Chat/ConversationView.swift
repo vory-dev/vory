@@ -47,7 +47,7 @@ struct ConversationView: View {
             let row = MorphState.shared.chatRowBottom
             // The closed Duo's row stands lower (#558: `TopBarRoom.barPadding`), as MorphTopBar's `stripClosed` reads it.
             let closed = model.tabBarVertical && VoryTabBar.statusStrip(windowGeometry.safeArea) != nil && barLift == 0
-            return row > 0 ? windowGeometry.safeArea.top + TopBarRoom.barPadding(closed: closed) - barLift + row : 0
+            return row > 0 ? windowGeometry.safeArea.top + TopBarRoom.barPadding(closed: closed, paneSafeTop: windowGeometry.paneSafeTop) - barLift + row : 0
         }
         return headerBottom
     }

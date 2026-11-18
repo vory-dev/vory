@@ -47,7 +47,7 @@ struct ChatListView: View {
     /// itself, over its first row.
     private var rowRoom: CGFloat {
         TopBarRoom.inset(barsVertical: model.tabBarVertical, statusInCorner: statusInCorner, barOn: MorphTopBar.active(model),
-                         rowBottom: MorphState.shared.rootRowBottom)
+                         rowBottom: MorphState.shared.rootRowBottom, paneSafeTop: windowGeometry.paneSafeTop)
     }
     /// The closed Duo's list has no sections (#697): the Scheduled row, its chats, each project's header and the chats
     /// are rows of one section. There the page is one surface (#693), and the gap the list keeps between two sections

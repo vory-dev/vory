@@ -100,7 +100,24 @@ enum TopBarRoom {
     /// The bar's padding over its row (MorphTopBar's top padding): 4, and 11 on the closed Duo, where the row's face then
     /// has 11 over it and 11 under it to the band's opaque bottom, even, as the open Duo upright reads (#558: it sat 4 over
     /// and 11 under). The whole closed row moves with it, the list's and a chat's alike, and the pages' room under it.
-    static func barPadding(closed: Bool) -> CGFloat { closed ? 11 : 4 }
+    /// In a pane (`paneSafeTop`, a window narrower or shorter than its screen: Split View), the row stands at least
+    /// `paneRowTop` under the window's top, where the app beside it has its bar: a pane with no status over it has almost
+    /// no safe area at its top, and 4 under that put the row against the window's edge (61). A pane whose safe top is
+    /// already that far down (an iPad's Split View, under its status bar) keeps 4.
+    static func barPadding(closed: Bool, paneSafeTop: CGFloat? = nil) -> CGFloat {
+        let base: CGFloat = closed ? 11 : 4
+        guard let safeTop = paneSafeTop else { return base }
+        return max(base, paneRowTop - safeTop)
+    }
+    /// A pane's row top, from the window's top: a measured value, measured on the iPhone Duo in Split View, where the app
+    /// beside Vory stood its bar's items 22 pt lower than Vory's. UIKit gives no metric for a compact pane's bar top.
+    static let paneRowTop: CGFloat = 26
+    /// A window smaller than its screen in either direction (Split View, a Stage Manager window): a pane. A whole-screen
+    /// window (a phone, an iPad in full screen, the Duo in any pose) isn't. Unknown sizes (0) aren't either.
+    static func isPane(window: CGSize, screen: CGSize) -> Bool {
+        guard window.width > 0, window.height > 0, screen.width > 0, screen.height > 0 else { return false }
+        return window.width < screen.width - 1 || window.height < screen.height - 1
+    }
     /// The gap between the row's bottom and the page.
     static let gap: CGFloat = 8
     /// The row's room (stage 1's: the row's bottom, in the bar's space, plus the bar's padding and a gap) where nothing
@@ -111,9 +128,10 @@ enum TopBarRoom {
     /// from the page: a room keyed on what the page measured flapped, stuck, or missed (the stage 2 A/B).
     /// ASSUMPTION (the one line to change if a device ever breaks it): a status standing in a top corner means the system
     /// keeps no band of its own under the row.
-    static func inset(barsVertical: Bool, statusInCorner: Bool, barOn: Bool, rowBottom: CGFloat) -> CGFloat {
+    /// In a pane (`paneSafeTop`) the room moves down with the row (`barPadding`).
+    static func inset(barsVertical: Bool, statusInCorner: Bool, barOn: Bool, rowBottom: CGFloat, paneSafeTop: CGFloat? = nil) -> CGFloat {
         guard barOn, rowBottom > 0 else { return 0 }
-        if barsVertical { return (rowBottom + barPadding(closed: true) + gap).rounded() }
+        if barsVertical { return (rowBottom + barPadding(closed: true, paneSafeTop: paneSafeTop) + gap).rounded() }
         return statusInCorner ? cornerRoom : 0
     }
     /// The root row's bottom in the bar's space (`MorphState.rootRowBottom`) from its slots' measured frames: its tallest

@@ -90,12 +90,21 @@ struct TourView: View {
                         ForEach(TourBeat.allCases) { beat in
                             beatPage(beat, size: geo.size)
                                 .dynamicTypeSize(...Self.largestText)
+                                // Each page as wide as the whole window, its content where it was: inside the safe
+                                // area's sides. A side inset (the closed iPhone Duo's 84 pt at its right) is the page's
+                                // own empty edge, where the glow shows, not the next page's start.
+                                .padding(.leading, geo.safeAreaInsets.leading)
+                                .padding(.trailing, geo.safeAreaInsets.trailing)
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(beat)
                         }
                     }
                     .scrollTargetLayout()
                 }
+                // The pages fill the window's width. Inside the safe area's width, a window with a side inset showed the
+                // next page's first points in that inset: on the closed Duo, page 2's bots on page 1 (61). No side inset
+                // (a phone, an iPad, the open Duo upright): nothing changes.
+                .ignoresSafeArea(.container, edges: .horizontal)
                 .scrollTargetBehavior(.paging)
                 .scrollPosition(id: $page)
                 .scrollIndicators(.hidden)
@@ -111,7 +120,8 @@ struct TourView: View {
                     // The app's own chat keeps every text size; its room comes from what's around it as measured.
                     TourChatLayer(chat: chat, progress: reduceMotion ? CGFloat(current.rawValue) : progress, size: geo.size,
                                   origin: geo.frame(in: .global).origin, mention: mentionDue,
-                                  room: TourChatLayer.Room(top: bubbleBottom, bottom: controlsTop))
+                                  room: TourChatLayer.Room(top: bubbleBottom, bottom: controlsTop),
+                                  pageWidth: geo.size.width + geo.safeAreaInsets.leading + geo.safeAreaInsets.trailing)
                         .id(ObjectIdentifier(chat))
                     TourChatWatch(chat: chat) { chatMoved(to: $0) }
                         .id(ObjectIdentifier(chat))
@@ -789,6 +799,9 @@ struct TourChatLayer: View {
     var mention = false
     /// What's around the chat, as measured: the chat sits between them.
     var room = Room()
+    /// A page's width (the window's, side insets and all): the chat moves by it between pages, as the pages do. 0 (unset)
+    /// is the layer's own width, which is the page's where the window has no side inset.
+    var pageWidth: CGFloat = 0
     @Environment(\.windowGeometry) private var windowGeometry
 
     /// Where Vory's bubble ends (the chat starts under it) and where Continue and the dots start (the chat ends over
@@ -811,7 +824,7 @@ struct TourChatLayer: View {
             // Its own view, so the swipe moving it doesn't redraw the thread.
             TourChatCard(chat: chat, mention: mention)
                 .frame(width: min(size.width - 32, 560), height: frame.height)
-                .position(x: size.width / 2 + slide * size.width, y: frame.midY)
+                .position(x: size.width / 2 + slide * (pageWidth > 0 ? pageWidth : size.width), y: frame.midY)
                 .animation(.snappy, value: frame)
         }
     }

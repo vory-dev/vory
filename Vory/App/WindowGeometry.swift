@@ -16,6 +16,18 @@ final class WindowGeometry {
     var bounds: CGRect = .zero
     /// The window's safe-area insets: each edge its own value, never assumed symmetric.
     var safeArea: EdgeInsets = EdgeInsets()
+    /// The size of the screen the window is on: a window smaller than it is a pane (`TopBarRoom.isPane`, 61).
+    var screen: CGSize = .zero
+    /// The safe area's top when the window is a pane, for the top bar's row and the pages' room under it; nil otherwise.
+    /// iOS only: a Mac window is always smaller than its screen, and the Mac's bar is its own (`screen` is never read
+    /// there either: only the iOS reader sets it, so it stays zero).
+    var paneSafeTop: CGFloat? {
+        #if os(iOS)
+        TopBarRoom.isPane(window: bounds.size, screen: screen) ? safeArea.top : nil
+        #else
+        nil
+        #endif
+    }
     /// The keyboard's frame in window space when one is up at the bottom of the window;
     /// `.null` when there is none, it is hidden, or it does not sit on the window's bottom edge
     /// (a floating iPad keyboard, another scene's).
@@ -186,6 +198,8 @@ struct WindowGeometryReader: UIViewRepresentable {
             let keyboard = WindowGeometry.keyboardRect(window: bounds, end: end)
             if geometry.bounds != bounds { geometry.bounds = bounds }
             if geometry.safeArea != measured { geometry.safeArea = measured }
+            let screen = window.screen.bounds.size
+            if geometry.screen != screen { geometry.screen = screen }
             if geometry.keyboard != keyboard { geometry.keyboard = keyboard }
             let high = WindowGeometry.highOverlap(now: geometry.keyboardOverlap, held: geometry.keyboardHighOverlap)
             if geometry.keyboardHighOverlap != high { geometry.keyboardHighOverlap = high }

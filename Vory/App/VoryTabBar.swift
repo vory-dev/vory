@@ -431,6 +431,7 @@ struct HidesTabBar: ViewModifier {
 struct TabRoot: ViewModifier {
     @Environment(AppModel.self) private var model
     @Environment(\.statusInCorner) private var statusInCorner
+    @Environment(\.windowGeometry) private var windowGeometry
     /// The page's pull-to-refresh state when its `.reloadable` is applied outside this marker
     /// (Bots, Files): by environment then, by preference when it sits inside (Home, Projects,
     /// the Board, Status, Sessions, Tasks). The bar's title capsule hosts the wheel either way;
@@ -464,7 +465,8 @@ struct TabRoot: ViewModifier {
             // Where nothing of the system's keeps a band under the bar's row (the closed Duo, the open Duo upright), the
             // stack starts under the row (#340).
             .background(TopBarRoomProbe(tab: tab, room: TopBarRoom.inset(barsVertical: model.tabBarVertical, statusInCorner: statusInCorner,
-                                                               barOn: MorphTopBar.active(model), rowBottom: MorphState.shared.rootRowBottom)).frame(width: 0, height: 0))
+                                                               barOn: MorphTopBar.active(model), rowBottom: MorphState.shared.rootRowBottom,
+                                                               paneSafeTop: windowGeometry.paneSafeTop)).frame(width: 0, height: 0))
             // "At root" is set by the probe below: on a swipe back SwiftUI's onAppear fires as
             // the pop begins, and the bar's capsules came back over the pushed page before it
             // had moved (2026-10-12: "swiping back on other pages is broken"). The probe
@@ -939,7 +941,8 @@ struct ClosedChatsRoom: ViewModifier {
     func body(content: Content) -> some View {
         let closed = TopBarRoom.closedStrip(barsVertical: model.tabBarVertical, size: windowGeometry.bounds.size)
         content.safeAreaPadding(.top, closed ? TopBarRoom.inset(barsVertical: model.tabBarVertical, statusInCorner: statusInCorner,
-                                                               barOn: MorphTopBar.active(model), rowBottom: MorphState.shared.rootRowBottom) : 0)
+                                                               barOn: MorphTopBar.active(model), rowBottom: MorphState.shared.rootRowBottom,
+                                                               paneSafeTop: windowGeometry.paneSafeTop) : 0)
     }
 }
 
