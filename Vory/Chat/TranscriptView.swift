@@ -3066,18 +3066,13 @@ enum LandBeforeCommit {
 
     /// In the update that found the thread past its end (see the type's comment). `end` and `from` are the reading's own.
     static func now(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, end: CGFloat, from: CGFloat) {
-        let live = sv.contentOffset.y
-        let target = max(-sv.adjustedContentInset.top, end)
         let phase = anchor.phaseNow
-        let why: String?
-        if abs(live - from) >= 0.5 { why = "offsets" }
-        else if target >= live - 1 { why = "landed" }
-        else if metrics.userScrolling { why = "finger" }
-        else if phase != .idle, phase != .animating { why = "phase" }
-        else { why = anchor.holdsForLanding }
-        if why == nil {
-            sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: target), animated: false)
-            early[ObjectIdentifier(sv)] = target
+        let d = LandRule.now(live: sv.contentOffset.y, from: from, end: end, topInset: sv.adjustedContentInset.top,
+                             finger: metrics.userScrolling, idleOrAnimating: phase == .idle || phase == .animating,
+                             hold: anchor.holdsForLanding)
+        if d.why == nil {
+            sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: d.target), animated: false)
+            early[ObjectIdentifier(sv)] = d.target
         }
     }
 
@@ -3099,17 +3094,48 @@ enum LandBeforeCommit {
         let from = sv.contentOffset.y
         let end = max(-ins.top, sv.contentSize.height + ins.bottom - sv.bounds.height)
         let phase = d.anchor.phaseNow
-        let why: String?
-        // Past the end: landed. Short of it: only after a set by `now` this turn, whose height UIKit didn't take.
-        if from <= end + 1, set == nil || from >= end - 1 { why = "landed" }
+        let why = LandRule.run(from: from, end: end, set: set, background: d.metrics.sceneInBackground,
+                               locked: d.metrics.stickToBottom, finger: d.metrics.userScrolling,
+                               idleOrAnimating: phase == .idle || phase == .animating, viewWhy: d.viewWhy(),
+                               hold: d.anchor.holdsForLanding)
         // #713: asked in front, run after the switch: no landing in the background (`resyncAfterBackground`).
-        else if d.metrics.sceneInBackground { why = "background"; d.metrics.skippedInBackground = true }
-        else if !d.metrics.stickToBottom { why = "unstuck" }
-        else if d.metrics.userScrolling { why = "finger" }
-        else if phase != .idle, phase != .animating { why = "phase" }
-        else if let v = d.viewWhy() { why = v }
-        else { why = d.anchor.holdsForLanding }
+        if why == "background" { d.metrics.skippedInBackground = true }
         if why == nil { sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: end), animated: false) }
+    }
+}
+
+/// The past-end landing's two decisions as pure rules (#729), so they can be tested with the figures alone: what
+/// `LandBeforeCommit.now` and `.run` read goes in, and their decision comes out, in the same order of checks as before.
+/// No side effects; the callers set the offset (and `run` marks the background's skip). Every input is a read with no
+/// side effects (UIKit's figures, the thread's flags, the view's reason, the place keeper's hold), now all taken before
+/// the decision instead of as each check was reached.
+enum LandRule {
+    /// `LandBeforeCommit.now`: the offset it would set and why it doesn't (nil: it sets `target`). `live` is UIKit's
+    /// offset now, `from` and `end` the reading's own offset and end, `topInset` UIKit's adjusted top inset.
+    static func now(live: CGFloat, from: CGFloat, end: CGFloat, topInset: CGFloat, finger: Bool, idleOrAnimating: Bool,
+                    hold: String?) -> (target: CGFloat, why: String?) {
+        let target = max(-topInset, end)
+        let why: String?
+        if abs(live - from) >= 0.5 { why = "offsets" }
+        else if target >= live - 1 { why = "landed" }
+        else if finger { why = "finger" }
+        else if !idleOrAnimating { why = "phase" }
+        else { why = hold }
+        return (target, why)
+    }
+
+    /// `LandBeforeCommit.run`: why it doesn't set UIKit's end (nil: it sets it). `from` is UIKit's offset, `end` UIKit's
+    /// own end, `set` where `now` set the offset this turn (nil: it didn't), `locked` the thread's lock to its end.
+    static func run(from: CGFloat, end: CGFloat, set: CGFloat?, background: Bool, locked: Bool, finger: Bool,
+                    idleOrAnimating: Bool, viewWhy: String?, hold: String?) -> String? {
+        // Past the end: landed. Short of it: only after a set by `now` this turn, whose height UIKit didn't take.
+        if from <= end + 1, set == nil || from >= end - 1 { return "landed" }
+        if background { return "background" }
+        if !locked { return "unstuck" }
+        if finger { return "finger" }
+        if !idleOrAnimating { return "phase" }
+        if let viewWhy { return viewWhy }
+        return hold
     }
 }
 #endif
