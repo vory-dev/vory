@@ -242,6 +242,32 @@ import Testing
         #expect(SessionCache.load(connection: own, profile: "default").map(\.id) == [DemoContent.botChatID], "the sweep took a gateway's own list")
     }
 
+    #if os(iOS)
+    /// The replay's fingerprint (#487) holds still across a Home load (`HomeCache`, #720): Home's kept numbers count by
+    /// being there and its kept chats by what they list, as the chat lists' do, so a load that only brings new numbers
+    /// changes no part, and a chat that comes or goes still shows.
+    @Test func theReplaysFingerprintHoldsStillAcrossAHomeLoad() throws {
+        let own = UUID()
+        defer { HomeCache.forget(connection: own) }
+        let m = AppModel()
+        let list = [StoredSession(id: DemoContent.botChatID, title: "Bot Chat", lastActive: 1, messageCount: 4)]
+        func usage(_ n: Int) throws -> UsageAnalytics {
+            try JSONDecoder().decode(UsageAnalytics.self, from: Data(#"{"totals":{"totalSessions":\#(n)}}"#.utf8))
+        }
+        HomeCache.save(sessions: list, connection: own, profile: "default", allBots: false, ephemeral: false)
+        HomeCache.save(usage: try usage(2), connection: own, profile: "default", days: 30, ephemeral: false)
+        func home() -> [String] { AppFingerprint.lines(m).filter { $0.contains(own.uuidString) } }
+        let before = home()
+        #expect(before.count == 3, "Home's kept chats (hash and ids) and numbers: \(before)")
+        HomeCache.save(usage: try usage(3), connection: own, profile: "default", days: 30, ephemeral: false)
+        HomeCache.save(sessions: list, connection: own, profile: "default", allBots: false, ephemeral: false)
+        #expect(home() == before, "a load's new numbers changed the fingerprint")
+        let more = list + [StoredSession(id: "20261015_080000_extra", title: "Another", lastActive: 2, messageCount: 1)]
+        HomeCache.save(sessions: more, connection: own, profile: "default", allBots: false, ephemeral: false)
+        #expect(home() != before, "a chat that came went unseen")
+    }
+    #endif
+
     /// The sweep at launch leaves a demo that is already running alone (a test build started in it, `-vory-demo`), and
     /// takes the demo's keys when it isn't; leaving the demo sweeps either way. It takes the demo's gateway id only.
     @Test func theLaunchSweepSkipsADemoThatRuns() throws {

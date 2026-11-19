@@ -47,7 +47,7 @@ struct ConversationView: View {
             let row = MorphState.shared.chatRowBottom
             // The closed Duo's row stands lower (#558: `TopBarRoom.barPadding`), as MorphTopBar's `stripClosed` reads it.
             let closed = model.tabBarVertical && VoryTabBar.statusStrip(windowGeometry.safeArea) != nil && barLift == 0
-            return row > 0 ? windowGeometry.safeArea.top + TopBarRoom.barPadding(closed: closed) - barLift + row : 0
+            return row > 0 ? windowGeometry.safeArea.top + TopBarRoom.barPadding(closed: closed, paneSafeTop: windowGeometry.paneSafeTop) - barLift + row : 0
         }
         return headerBottom
     }
@@ -55,16 +55,40 @@ struct ConversationView: View {
     @Environment(\.barLift) private var barLift
     private var foldLift: CGFloat {
         guard dockSlotBottom > 0, dockHeight > 0 else { return 0 }
-        let bottom = dockSlotBottom - barReserve
+        let bottom = dockSlotBottom - barReserve - dockShift
         let dock = CGRect(x: 0, y: bottom - dockHeight, width: 1, height: dockHeight)
         let listTop = listReach > 0 ? bottom - BottomDock.bottomPadding - listReach : nil
         return regions.dockLift(dock: dock, listTop: listTop, held: liftHeldForList, restingBottom: restingDockBottom)
     }
     /// Where the dock's bottom edge stands with no keyboard, in the same space as `foldLift`'s `bottom` (window space, the
-    /// bar's reserve taken off): the window's safe bottom less the bar's reserve. Nil until the window is measured.
+    /// bar's reserve taken off): the window's safe bottom less the bar's reserve, less the 59 shift. Nil until the window is
+    /// measured.
     private var restingDockBottom: CGFloat? {
-        windowGeometry.bounds.height > 0 ? windowGeometry.bounds.height - windowGeometry.safeArea.bottom - barReserve : nil
+        ReplyBarRules.restingDockBottom(windowHeight: windowGeometry.bounds.height, safeBottom: windowGeometry.safeArea.bottom,
+                                        barReserve: barReserve, noBarBelowWide: noBarBelowWide)
     }
+    /// #731: a wide window (the chat beside the list, or opened from Home) with no tab bar under the chat. The bar rests
+    /// lower there (`ReplyBarRules.wideDrop`): nothing at the bottom to rest level with.
+    private var noBarBelowWide: Bool { wide && barReserve == 0 }
+    /// 59: the dock's shift below 57's place at rest (`ReplyBarRules.dockShift`): negative on a phone with a home
+    /// indicator, 0 with the keyboard up or the tab bar under the chat.
+    private var dockShift: CGFloat {
+        ReplyBarRules.dockShift(safeBottom: windowGeometry.safeArea.bottom, keyboardUp: windowGeometry.keyboardOverlap > 0,
+                                barBelow: barReserve > 0, noBarBelowWide: noBarBelowWide)
+    }
+    #if DEBUG
+    /// #731's measure: the dock's rest terms on a 1 pt element (`debug.dockrest`), with `-vory-dock-rest` only.
+    static let dockRestOn = ProcessInfo.processInfo.arguments.contains("-vory-dock-rest")
+    private var dockRestReadout: String {
+        let g = windowGeometry
+        func n(_ v: CGFloat) -> String { String(format: "%.1f", v) }
+        return "safeBottom \(n(g.safeArea.bottom));overhang \(n(ReplyBarRules.overhang));gap \(n(ReplyBarRules.gap))"
+            + ";barReserve \(n(barReserve));vertical \(model.tabBarVertical ? 1 : 0);wide \(wide ? 1 : 0);foldLift \(n(foldLift))"
+            + ";noBarBelowWide \(noBarBelowWide ? 1 : 0);dockShift \(n(dockShift))"
+            + ";restingGap \(n(ReplyBarRules.restingGap(safeBottom: g.safeArea.bottom, noBarBelowWide: noBarBelowWide)))"
+            + ";slotBottom \(n(dockSlotBottom));window \(n(g.bounds.height));keyboard \(n(g.keyboardOverlap))"
+    }
+    #endif
     #endif
     /// The floating header's height on iOS; the Mac's header is the window toolbar, outside the thread.
     #if os(macOS)
@@ -317,6 +341,12 @@ struct ConversationView: View {
             // as the fallback (`keyboardOverlap`, the window's number, unanimated).
             thread(chat)
                 .ignoresSafeArea(.keyboard, edges: .bottom)
+            #if DEBUG
+            if Self.dockRestOn {
+                Color.clear.frame(width: 1, height: 1).allowsHitTesting(false)
+                    .accessibilityElement().accessibilityIdentifier("debug.dockrest").accessibilityLabel(dockRestReadout)
+            }
+            #endif
             // The dock is a sibling, not an overlay of the thread: it sits in the keyboard's own
             // safe area and rides the keyboard's animation (2026-10-11: the bar "lags
             // behind the keyboard opening and closing", "the keyboard collapses completely
@@ -325,7 +355,7 @@ struct ConversationView: View {
             // Above the tab bar when the bar stands under the chat (a wide layout with the bar
             // along the bottom: the open Duo upright, the iPad): the pages do not pick up the
             // bar's inset on this iOS (see MainTabView), and the dock sat under the bar.
-            dock(chat).frame(maxWidth: wide ? ChatStyle.readingColumn : .infinity, alignment: .bottom).padding(.bottom, barReserve + foldLift)
+            dock(chat).frame(maxWidth: wide ? ChatStyle.readingColumn : .infinity, alignment: .bottom).padding(.bottom, barReserve + foldLift + dockShift)
                 .environment(\.chatHeaderBottom, chatHeaderBottom)
                 .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { dockSlotBottom = $0 }
                 .onPreferenceChange(ComposerListReach.self) { listReach = $0 }
@@ -487,7 +517,13 @@ struct ConversationView: View {
             // every frame of an interactive keyboard dismiss too: the thread's rows no longer
             // rebuild for it (TranscriptRow takes its open states as values), so the thread
             // rides with the keyboard instead of holding and jumping (2026-10-11).
-            .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: { dockTop = $0 }
+            .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: {
+                dockTop = $0
+                #if DEBUG
+                // 59's frame read: the dock's top on every change, beside the thread's GEO lines (`-vory-geometry-log`).
+                if ThreadGeometryWatch.log { Perf.stamp("DOCK top \(Int($0.rounded()))") }
+                #endif
+            }
     }
     private func header(_ chat: ChatSession) -> some View {
         // The fold of a partly open Duo, where it crosses the thread: the pill keeps off it.

@@ -126,6 +126,10 @@ struct ComposerTextView: View {
     var menuOpen = false
     var onTab: () -> Bool = { false }
     var onEscape: () -> Bool = { false }
+    /// 59: the iPhone's "Dictate" action; the Mac's field doesn't offer it (its mic is a click), so it's unused here.
+    var onDictate: (() -> Void)? = nil
+    /// 60: the iPhone's keyboard request (see the iOS field); taken so the call site is one, unused here.
+    var refocus = 0
     @FocusState private var isFocused: Bool
     /// The keys an input method has while it composes (see ComposedKeys).
     @State private var composed = ComposedKeys()
@@ -427,6 +431,13 @@ struct ComposerTextView: UIViewRepresentable {
     var menuOpen = false
     var onTab: () -> Bool = { false }
     var onEscape: () -> Bool = { false }
+    /// 59: VoiceOver's and Switch Control's "Dictate" on the field (they can't hold the bar): starts the mic's latched
+    /// dictation. Nil where the bar offers none (the New Message sheet, the tour).
+    var onDictate: (() -> Void)? = nil
+    /// 60: a change asks, once, for the keyboard while `focused` is true: the field becomes first responder as soon as it
+    /// has a window (a field inserted with the card has none yet), and a field that's already first responder with no
+    /// keyboard (back from the background) resigns and becomes it again, without `focused` passing through false.
+    var refocus = 0
 
     static let acceptedTypes: [UTType] = [.image, .movie, .pdf, .audio, .plainText, .text, .fileURL, .data]
 
@@ -460,6 +471,15 @@ struct ComposerTextView: UIViewRepresentable {
 
     func updateUIView(_ v: PasteTextView, context: Context) {
         context.coordinator.parent = self
+        // 59: "Dictate" while the bar offers it; the action reads the latest closure through the coordinator.
+        if (v.accessibilityCustomActions?.isEmpty == false) != (onDictate != nil) {
+            v.accessibilityCustomActions = onDictate == nil ? nil : [
+                UIAccessibilityCustomAction(name: "Dictate") { [weak coordinator = context.coordinator] _ in
+                    MainActor.assumeIsolated { coordinator?.parent.onDictate?() }
+                    return true
+                },
+            ]
+        }
         // No typing where the bar is read-only (the tour, `composerReadOnly`): no keyboard, no selection, and VoiceOver
         // reads the words as text rather than offering a field that takes nothing.
         let readOnly = context.environment.composerReadOnly
@@ -479,7 +499,14 @@ struct ComposerTextView: UIViewRepresentable {
             v.enablesReturnKeyAutomatically = returnSends
             v.reloadInputViews()
         }
-        if focused, !v.isFirstResponder, v.window != nil {
+        // 60: a new keyboard request, kept until the field has a window (`PasteTextView.didMoveToWindow`).
+        if refocus != context.coordinator.appliedRefocus {
+            context.coordinator.appliedRefocus = refocus
+            context.coordinator.wantsKeyboard = focused
+        }
+        if context.coordinator.wantsKeyboard, v.window != nil {
+            context.coordinator.bringKeyboard(v)
+        } else if focused, !v.isFirstResponder, v.window != nil {
             DispatchQueue.main.async { v.becomeFirstResponder() }
         } else if !focused, v.isFirstResponder {
             DispatchQueue.main.async { v.resignFirstResponder() }
@@ -516,13 +543,35 @@ struct ComposerTextView: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate, UITextPasteDelegate {
         var parent: ComposerTextView
         init(parent: ComposerTextView) { self.parent = parent }
+        /// 60: the last `refocus` taken, an open keyboard request, and the resign-and-become in progress (its end and
+        /// begin of editing don't touch `focused`).
+        var appliedRefocus = 0
+        var wantsKeyboard = false
+        private var refocusing = false
+
+        /// 60: the keyboard for a field with a window, once: first responder if it isn't; resign and become it again if it
+        /// is (its keyboard didn't come back with it).
+        func bringKeyboard(_ v: PasteTextView) {
+            wantsKeyboard = false
+            DispatchQueue.main.async { [weak self, weak v] in
+                guard let self, let v, v.window != nil, self.parent.focused else { return }
+                if v.isFirstResponder {
+                    self.refocusing = true
+                    v.resignFirstResponder()
+                    v.becomeFirstResponder()
+                    self.refocusing = false
+                } else {
+                    v.becomeFirstResponder()
+                }
+            }
+        }
 
         func textViewDidChange(_ v: UITextView) {
             (v as? PasteTextView)?.placeholderLabel.isHidden = !v.text.isEmpty
             if parent.text != v.text { parent.text = v.text }
         }
-        func textViewDidBeginEditing(_ v: UITextView) { if !parent.focused { parent.focused = true } }
-        func textViewDidEndEditing(_ v: UITextView) { if parent.focused { parent.focused = false } }
+        func textViewDidBeginEditing(_ v: UITextView) { if !refocusing, !parent.focused { parent.focused = true } }
+        func textViewDidEndEditing(_ v: UITextView) { if !refocusing, parent.focused { parent.focused = false } }
 
         func textView(_ v: UITextView, shouldChangeTextIn range: NSRange, replacementText s: String) -> Bool {
             // A hardware Tab the input method took while composing with the chooser open, handed
@@ -592,6 +641,12 @@ struct ComposerTextView: UIViewRepresentable {
 final class PasteTextView: UITextView {
     let placeholderLabel = UILabel()
     weak var coordinator: ComposerTextView.Coordinator?
+
+    /// 60: a keyboard request made before the field had a window is met as soon as it has one.
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil, let coordinator, coordinator.wantsKeyboard { coordinator.bringKeyboard(self) }
+    }
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)

@@ -38,14 +38,16 @@ enum SessionCache {
         if let data = try? JSONEncoder().encode(sessions) { UserDefaults.standard.set(data, forKey: key(connection: connection, profile: profile)) }
     }
 
-    static func clearAll() {
-        let d = UserDefaults.standard
-        for k in d.dictionaryRepresentation().keys where k.hasPrefix(prefix) { d.removeObject(forKey: k) }
+    /// The chat lists' keys, and Home's last numbers and chats (`HomeCache`, #720): Settings clears and counts them as one.
+    private static func cached(_ k: String) -> Bool { k.hasPrefix(prefix) || k.hasPrefix(HomeCache.prefix) }
+
+    static func clearAll(in d: UserDefaults = .standard) {
+        for k in d.dictionaryRepresentation().keys where cached(k) { d.removeObject(forKey: k) }
     }
 
-    static var approximateBytes: Int {
-        let d = UserDefaults.standard
-        return d.dictionaryRepresentation().filter { $0.key.hasPrefix(prefix) }.values.compactMap { ($0 as? Data)?.count }.reduce(0, +)
+    static var approximateBytes: Int { approximateBytes(in: .standard) }
+    static func approximateBytes(in d: UserDefaults) -> Int {
+        d.dictionaryRepresentation().filter { cached($0.key) }.values.compactMap { ($0 as? Data)?.count }.reduce(0, +)
     }
 }
 

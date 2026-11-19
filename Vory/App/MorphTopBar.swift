@@ -510,7 +510,7 @@ struct MorphTopBar: View {
     }
     #endif
     /// The bar's padding over its row: the closed Duo's even row (#558), 4 elsewhere (`TopBarRoom.barPadding`).
-    private var topPadding: CGFloat { TopBarRoom.barPadding(closed: stripClosed && !inBand) }
+    private var topPadding: CGFloat { TopBarRoom.barPadding(closed: stripClosed && !inBand, paneSafeTop: windowGeometry.paneSafeTop) }
     /// The bar up in the status band (the open Duo upright, or half open like a laptop): a chat's row stands in it too.
     private var inBand: Bool { lift > 0 }
     /// Between Back and the face, up in the band.

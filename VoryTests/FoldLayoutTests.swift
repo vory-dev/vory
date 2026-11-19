@@ -404,6 +404,59 @@ import VoryCore
         #expect(DeskSplit.halves(page: deskPage, fold: atBottom.offsetBy(dx: 0, dy: 0.1), accessibilityText: false, editing: false) == nil)
     }
 
+    // MARK: Home in two columns on a wide window held wider than tall (#541)
+
+    /// The open Duo on its side: the window 951 x 669, Home's page 867 wide (the trailing strip takes the rest), its
+    /// content inside the 16 pt margins, the fold up the middle at 455.5 to 495.5 (the stills' readout, 2026-10-28).
+    private let sideWindow = CGSize(width: 951, height: 669)
+    private let sideContent = CGRect(x: 16, y: 82, width: 835, height: 553)
+    private let upFold = CGRect(x: 455.5, y: 0, width: 40, height: 669)
+
+    @Test func homeTakesTheFoldAsItsGutterOnTheDuoOnItsSide() {
+        // Both columns' edges on whole points clear of the fold at half points (439.5 rounded onto the 3x grid ran to
+        // 455.67): the leading column ends at 455, the trailing one starts at 496.
+        let s = HomeColumns.split(content: sideContent, window: sideWindow, fold: upFold, wide: true, accessibilityText: false, editing: false)
+        #expect(s?.leading == 439)
+        #expect(s?.gap == 41)
+        #expect(s?.trailing == 355)
+        let end = sideContent.minX + (s?.leading ?? 0), start = end + (s?.gap ?? 0)
+        #expect(end == end.rounded() && start == start.rounded())
+        #expect(end <= upFold.minX && start >= upFold.maxX)
+    }
+
+    @Test func homeCentresTwoColumnsOnAnIPadInLandscape() {
+        // The 11" iPad Pro in landscape (1,210 x 834): two 500s, 24 apart. A narrower landscape window: two halves.
+        let pad = HomeColumns.split(content: CGRect(x: 16, y: 0, width: 1178, height: 760), window: CGSize(width: 1210, height: 834), fold: nil, wide: true, accessibilityText: false, editing: false)
+        #expect(pad?.leading == 500)
+        #expect(pad?.gap == 24)
+        #expect(pad?.trailing == 500)
+        let small = HomeColumns.split(content: CGRect(x: 16, y: 0, width: 768, height: 500), window: CGSize(width: 800, height: 600), fold: nil, wide: true, accessibilityText: false, editing: false)
+        #expect(small?.leading == 372)
+        #expect(small?.trailing == 372)
+    }
+
+    @Test func homeStaysOneColumnWhereTwoDontFitOrDontBelong() {
+        // Portrait (an iPad, the Duo upright), a compact width, the accessibility sizes, Home being edited, a column
+        // under 340 (a half under it beside the fold, or a landscape window under 2 x 340 + 24), the fold at the content's
+        // edge, and a page not laid out yet.
+        #expect(HomeColumns.split(content: CGRect(x: 16, y: 0, width: 802, height: 1100), window: CGSize(width: 834, height: 1210), fold: nil, wide: true, accessibilityText: false, editing: false) == nil)
+        #expect(HomeColumns.split(content: sideContent, window: sideWindow, fold: upFold, wide: false, accessibilityText: false, editing: false) == nil)
+        #expect(HomeColumns.split(content: sideContent, window: sideWindow, fold: upFold, wide: true, accessibilityText: true, editing: false) == nil)
+        #expect(HomeColumns.split(content: sideContent, window: sideWindow, fold: upFold, wide: true, accessibilityText: false, editing: true) == nil)
+        #expect(HomeColumns.split(content: sideContent, window: sideWindow, fold: CGRect(x: 520.5, y: 0, width: 40, height: 669), wide: true, accessibilityText: false, editing: false) == nil)
+        #expect(HomeColumns.split(content: CGRect(x: 16, y: 0, width: 700, height: 500), window: CGSize(width: 732, height: 600), fold: nil, wide: true, accessibilityText: false, editing: false) == nil)
+        #expect(HomeColumns.split(content: sideContent, window: sideWindow, fold: CGRect(x: 0, y: 0, width: 40, height: 669), wide: true, accessibilityText: false, editing: false) == nil)
+        #expect(HomeColumns.split(content: .zero, window: sideWindow, fold: upFold, wide: true, accessibilityText: false, editing: false) == nil)
+    }
+
+    @Test func homeTilesGoTwoToARowInANarrowColumnAtTheLargeSizes() {
+        // The Duo's right column (355): three below xxLarge, two from it. The iPad's (500): three at every size.
+        #expect(HomeTiles.inColumn(width: 355, large: false) == 3)
+        #expect(HomeTiles.inColumn(width: 355, large: true) == 2)
+        #expect(HomeTiles.inColumn(width: 500, large: true) == 3)
+        #expect(HomeTiles.inColumn(width: HomeTiles.narrowColumn, large: true) == 3)
+    }
+
     @Test func theDeskAnswersApprovalsInPlaceAndSendsTheRestToTheirChat() {
         let approval = PendingCard(id: "a", method: "approval", params: ["request_id": "r1", "session_id": "s1", "command": "ls"])
         let question = PendingCard(id: "q", method: "clarify", params: ["question": "Which branch?"])

@@ -393,6 +393,10 @@ struct TranscriptView: View {
             } action: { old, now in
                 metrics.contentHeight = now.height; metrics.containerHeight = now.container
                 metrics.distanceFromBottom = now.distance
+                #if os(iOS)
+                // #713: in the background the reading is kept and nothing is decided from it (`resyncAfterBackground`).
+                if metrics.sceneInBackground { metrics.skippedInBackground = true; return }
+                #endif
                 // Out of sight while a history lands: the lazy stack is still measuring its rows, so the quiet time
                 // before the thread is shown starts again (#449).
                 if landingOutOfSight, old.height != now.height { landingReveal?.cancel(); landingReveal = nil }
@@ -585,10 +589,42 @@ struct TranscriptView: View {
             .onChange(of: bottomInset) { _, _ in
                 guard metrics.stickToBottom, !metrics.userScrolling else { return }
                 insetSettle?.cancel()
+                #if DEBUG
+                if ThreadGeometryWatch.log { Perf.stamp("SETTLE armed") }
+                #endif
                 insetSettle = Task {
                     try? await Task.sleep(for: .milliseconds(80))
                     guard !Task.isCancelled, metrics.stickToBottom, !metrics.userScrolling else { return }
+                    #if DEBUG
+                    // 59: three readings of the distance at the fire (the guard reads the first): as reported; corrected as
+                    // decideAway corrects it (the offset's move since the report, less the place keeper's shift); and the
+                    // scroll view's own, from its live geometry.
+                    if ThreadGeometryWatch.log {
+                        #if os(iOS)
+                        let sv = metrics.scrollView
+                        let liveOffset = sv?.contentOffset.y ?? metrics.offsetY
+                        let live = sv.map { $0.contentSize.height + $0.adjustedContentInset.bottom - ($0.contentOffset.y + $0.bounds.height) }
+                        #else
+                        let liveOffset = metrics.offsetY
+                        let live: CGFloat? = nil
+                        #endif
+                        let corrected = metrics.distanceFromBottom - (liveOffset - metrics.offsetY) - anchor.shiftNow
+                        Perf.stamp(String(format: "SETTLE fire reported=%.1f corrected=%.1f live=%@", metrics.distanceFromBottom,
+                                          corrected, live.map { String(format: "%.1f", $0) } ?? "-"))
+                    }
+                    #endif
                     if holdingCard { followAfterHold = true; return }
+                    #if os(iOS)
+                    // Already at the end: the size-change anchor carried it. A follow asked now can run late (a held main
+                    // thread: the keyboard coming up) in an update that moves the margin again, and an eased scroll there
+                    // replaces the anchor's in-step move with an ease from the old place.
+                    guard abs(metrics.distanceFromBottom) > 4 else {
+                        #if DEBUG
+                        if ThreadGeometryWatch.log { Perf.stamp("SETTLE skip at end") }
+                        #endif
+                        return
+                    }
+                    #endif
                     if settling { scrollPosition.scrollTo(edge: .bottom) }
                     else { withAnimation(.easeOut(duration: 0.2)) { scrollPosition.scrollTo(edge: .bottom) } }
                 }
@@ -780,7 +816,16 @@ extension TranscriptView {
             // The app going to the background, from UIKit's own notification for this thread's scene.
             .onReceive(NotificationCenter.default.publisher(for: UIScene.didEnterBackgroundNotification)) { n in
                 guard (n.object as? UIScene) === metrics.scrollView?.window?.windowScene else { return }
+                // #713 r3: the lock as the scene enters the background, before anything grows while away; the first
+                // activation after it reads it once (`resyncAfterBackground`).
+                metrics.stuckAtBackground = metrics.stickToBottom
                 crossOffScreen("background")
+            }
+            // #713: back in front (active, from UIKit's own notification for this thread's scene), the decisions the
+            // background skipped, once.
+            .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { n in
+                guard (n.object as? UIScene) === metrics.scrollView?.window?.windowScene else { return }
+                resyncAfterBackground()
             }
             #endif
     }
@@ -996,14 +1041,28 @@ extension TranscriptView {
         // Only a move: the window's geometry reports the inset as a chat opens too, with no
         // keyboard, and stamped as one it held off the open's own landing (1.5 (23): a chat at
         // rest went a screen past its end, blank, a moment after it opened).
-        if inset != keyboardInset { keyboardMovedAt = Date() }
+        let moved = inset != keyboardInset
+        if moved { keyboardMovedAt = Date() }
+        #if DEBUG
+        if ThreadGeometryWatch.log { Perf.stamp("KB moved \(Int(inset))") }
+        #endif
         // Stuck, the keyboard going down, and the approval card in the dock or the thread at no height: the scroll to the
         // end goes without the spring (`dockHold`). Ordinary typing keeps it.
         let hold = dockHold(inset)
+        // 59: a keyboard move that finds the thread at its end with the size-change anchor at the bottom asks no spring: the
+        // anchor carries this move in step, the keyboard's own part in the keyboard's update and whatever lands with this
+        // one (the dock's last 21 pt, the card folding to the pill, the floor going). A spring asked here met the dock's
+        // change, which reaches the thread a pass later (its top is measured after layout), and restarted from the place
+        // before it: the rise's last 21 pt eased back (u9, u10) and the dismiss went 301 pt past the end (u10). Away from the
+        // end, with the anchor at the top (a card held, the thread away) or no move at all (the open), the spring as before.
+        let carried = ThreadFix.on && moved && !awayFromBottom && !holdingCard && abs(metrics.distanceFromBottom) <= 4
         withAnimation(.interpolatingSpring(mass: 3, stiffness: 1000, damping: 500, initialVelocity: 0)) {
             keyboardInset = inset
-            if metrics.stickToBottom, !hold { scrollPosition.scrollTo(edge: .bottom) }
+            if metrics.stickToBottom, !hold, !carried { scrollPosition.scrollTo(edge: .bottom) }
         }
+        #if DEBUG
+        if ThreadGeometryWatch.log, metrics.stickToBottom, !hold, carried { Perf.stamp(String(format: "KB skip at end dist=%.1f", metrics.distanceFromBottom)) }
+        #endif
         if hold { scrollAtOnce() }
         floorTask?.cancel()
         if inset == 0 || !keyboardFloors { keyboardFloor = 0 } else {
@@ -1213,17 +1272,24 @@ extension TranscriptView {
         noteLanding()
         var still = Transaction()
         still.disablesAnimations = true
-        withTransaction(still) { scrollPosition.scrollTo(edge: .bottom) }
-        // In the update that changed the content's height, UIKit still has the old height, and the scroll above lands
-        // against it: it moves nothing, and the thread was drawn past its end for a frame (a tool turn's rows folding as
-        // the next prompt went out, a 570 pt flash and back) until the next reading landed it. Locked to the end before
-        // this change (`locked` is read before this reading's own lock below it), the end is set in UIKit at once, in
-        // this same update, from this reading's own offset and distance (`LandBeforeCommit.now`), so the commit that
-        // carries the change carries the landing; and checked again just before the next commit against UIKit's own end
-        // (`LandBeforeCommit.ask`).
+        // In the update that changed the content's height, UIKit still has the old height, and the scroll to the bottom
+        // edge below lands against it: it moves nothing, and the thread was drawn past its end for a frame (a tool
+        // turn's rows folding as the next prompt went out, a 570 pt flash and back) until the next reading landed it.
+        // Locked to the end before this change (`locked` is read before this reading's own lock below it), the end is
+        // set in UIKit at once, in this same update, from this reading's own offset and distance
+        // (`LandBeforeCommit.now`), so the commit that carries the change carries the landing; and checked again just
+        // before the next commit against UIKit's own end (`LandBeforeCommit.ask`).
+        // #729: when `now` has set the end here, there is no scroll to the bottom edge as well. The two ends differ while
+        // UIKit's content size is still apart from the reading's: the edge is UIKit's (its content size), `now`'s is the
+        // reading's. Both in one landing, each set the thread past the other's end, and the next reading landed it
+        // again, for good: a chat on 58 opened hidden and stayed so (14,161 and 14,183 pt, 22 apart, about 1,000 times
+        // a second for 193 s, 2026-11-19); #729's loop on 58 had the same scroll to the edge in every turn. Where `now`
+        // doesn't set (another offset, a finger, a scroll in flight, the place keeper's hold, no reading's offset), the
+        // scroll to the edge is as before.
         #if os(iOS)
+        var setNow = false
         if ThreadFix.on, locked, let sv = metrics.scrollView, abs(sv.contentSize.height - metrics.contentHeight) >= 0.5 {
-            if let offset { LandBeforeCommit.now(sv, metrics, anchor, end: offset + distance, from: offset) }
+            if let offset { setNow = LandBeforeCommit.now(sv, metrics, anchor, end: offset + distance, from: offset) }
             LandBeforeCommit.ask(sv, metrics, anchor) {
                 if Date() <= overscrollEaseUntil { return "eased" }
                 if CardHold.shared.holding { return "card" }
@@ -1231,7 +1297,10 @@ extension TranscriptView {
                 return nil
             }
         }
+        #else
+        let setNow = false
         #endif
+        if !setNow { withTransaction(still) { scrollPosition.scrollTo(edge: .bottom) } }
     }
 
     /// The away flags after the distance changed. Under the fix (`ThreadFix`), decided once a run-loop turn, just before
@@ -1246,6 +1315,48 @@ extension TranscriptView {
         anchor.askAway { decideAway() }
     }
 
+    #if os(iOS)
+    /// #713: no landing, lock or away decision is made while the thread's scene is in the background (`.background`
+    /// only: Control Center, a notification or the switcher's peek leave the scene inactive and keep today's behavior).
+    /// There the system lays the window out again for its snapshot against held geometry, and a landing (`landPastTheEnd`,
+    /// `LandBeforeCommit`) or a flip of the size anchor's flag (`decideAway`) fed a layout that never settled: 58's
+    /// scene-update watchdog, 10 s of wall clock in the background (2026-11-17). The readings are still kept. Back in
+    /// front, once: the distance as UIKit has it now, then the landing and the away flags the action would have decided.
+    /// Past the end, it lands as the action lands it. Short of the end (r3): a thread that was stuck to its end when the
+    /// scene went to the background (`stuckAtBackground`, the lock as it was then) is put back on its end, once, in front,
+    /// without animation, its lock and the size anchor's flag on the end, so a reply still streaming is followed from
+    /// there; the size anchor alone didn't hold the end through the background's re-measure (the folded Duo, 2026-11-17:
+    /// 266 and 573 pt short, the button in). UIKit's offset is set at once, as `LandBeforeCommit.run` sets it (its `now`
+    /// and `ask` land only past the end), so the away flags are decided on the landed distance. A thread that wasn't stuck
+    /// keeps its place: no landing, the place keeper untouched.
+    private func resyncAfterBackground() {
+        let stuck = metrics.stuckAtBackground ?? metrics.stickToBottom
+        metrics.stuckAtBackground = nil
+        guard metrics.skippedInBackground, let sv = metrics.scrollView else { return }
+        metrics.skippedInBackground = false
+        let ins = sv.adjustedContentInset
+        let d = sv.contentSize.height + ins.bottom - (sv.contentOffset.y + sv.bounds.height)
+        metrics.distanceFromBottom = d
+        if d < -1, !metrics.userScrolling { landPastTheEnd(d, at: sv.contentOffset.y) }
+        else if d > 1, stuck, !metrics.userScrolling {
+            metrics.stickToBottom = true
+            var still = Transaction()
+            still.disablesAnimations = true
+            withTransaction(still) {
+                scrollPosition.scrollTo(edge: .bottom)
+                if awayFromBottom { awayFromBottom = false }
+            }
+            if ThreadFix.on, anchor.holdsForLanding == nil {
+                let end = max(-ins.top, sv.contentSize.height + ins.bottom - sv.bounds.height)
+                sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: end), animated: false)
+                metrics.offsetY = end
+            }
+            metrics.distanceFromBottom = 0
+        }
+        awayChanged(metrics.distanceFromBottom)
+    }
+    #endif
+
     /// The away flags, decided once a run-loop turn just before Core Animation's commit (`ThreadAnchor.askAway`), on the
     /// distance as drawn then, after every move of that turn (#704). The reported distance is corrected by how far the
     /// scroll view's offset has moved since it was reported (a fold, a fix or a re-set earlier in the turn moves it before
@@ -1256,6 +1367,8 @@ extension TranscriptView {
     /// animation, so no layout change landing in the same update is eased; the button keeps its own.
     private func decideAway() {
         #if os(iOS)
+        // #713: an ask made in front can run after the switch: nothing is decided in the background.
+        if metrics.sceneInBackground { metrics.skippedInBackground = true; return }
         let live = metrics.scrollView?.contentOffset.y ?? metrics.offsetY
         #else
         let live = metrics.offsetY
@@ -1788,6 +1901,15 @@ final class ScrollMetrics {
     /// The UIKit scroll view under the SwiftUI one, for a scroll by a measured distance: its
     /// offset and the rows' global frames are in the same points, so a delta is just a delta.
     weak var scrollView: UIScrollView?
+    /// #713: the thread's scene is in the background (never plain inactive): no landing or away decision is made there.
+    @MainActor var sceneInBackground: Bool { scrollView?.window?.windowScene?.activationState == .background }
+    /// #713: a decision was skipped in the background; the first activation after it re-syncs once (`resyncAfterBackground`).
+    var skippedInBackground = false
+    /// #713 r3: `stickToBottom` as the thread's scene entered the background (UIKit's didEnterBackground for it), before
+    /// anything grew while away: the background can still clear the lock (`mayFollow` reads a distance taken there). Read
+    /// and cleared by the first activation after it. iOS only; written and read on the main actor only (the view's
+    /// scene handlers), as `skippedInBackground` is.
+    var stuckAtBackground: Bool?
     #endif
     /// Locked to the bottom: the thread follows every new token, tool call and card. Only the
     /// user's own drag releases it; the jump button (or scrolling back down) locks it again.
@@ -2953,20 +3075,17 @@ enum LandBeforeCommit {
     private static var early: [ObjectIdentifier: CGFloat] = [:]
 
     /// In the update that found the thread past its end (see the type's comment). `end` and `from` are the reading's own.
-    static func now(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, end: CGFloat, from: CGFloat) {
-        let live = sv.contentOffset.y
-        let target = max(-sv.adjustedContentInset.top, end)
+    /// True when it set the offset (#729: the caller then doesn't also scroll to the bottom edge).
+    @discardableResult
+    static func now(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, end: CGFloat, from: CGFloat) -> Bool {
         let phase = anchor.phaseNow
-        let why: String?
-        if abs(live - from) >= 0.5 { why = "offsets" }
-        else if target >= live - 1 { why = "landed" }
-        else if metrics.userScrolling { why = "finger" }
-        else if phase != .idle, phase != .animating { why = "phase" }
-        else { why = anchor.holdsForLanding }
-        if why == nil {
-            sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: target), animated: false)
-            early[ObjectIdentifier(sv)] = target
-        }
+        let d = LandRule.now(live: sv.contentOffset.y, from: from, end: end, topInset: sv.adjustedContentInset.top,
+                             finger: metrics.userScrolling, idleOrAnimating: phase == .idle || phase == .animating,
+                             hold: anchor.holdsForLanding)
+        guard d.why == nil else { return false }
+        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: d.target), animated: false)
+        early[ObjectIdentifier(sv)] = d.target
+        return true
     }
 
     static func ask(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, viewWhy: @escaping @MainActor () -> String?) {
@@ -2987,15 +3106,61 @@ enum LandBeforeCommit {
         let from = sv.contentOffset.y
         let end = max(-ins.top, sv.contentSize.height + ins.bottom - sv.bounds.height)
         let phase = d.anchor.phaseNow
-        let why: String?
-        // Past the end: landed. Short of it: only after a set by `now` this turn, whose height UIKit didn't take.
-        if from <= end + 1, set == nil || from >= end - 1 { why = "landed" }
-        else if !d.metrics.stickToBottom { why = "unstuck" }
-        else if d.metrics.userScrolling { why = "finger" }
-        else if phase != .idle, phase != .animating { why = "phase" }
-        else if let v = d.viewWhy() { why = v }
-        else { why = d.anchor.holdsForLanding }
+        let why = LandRule.run(from: from, end: end, set: set, background: d.metrics.sceneInBackground,
+                               locked: d.metrics.stickToBottom, finger: d.metrics.userScrolling,
+                               idleOrAnimating: phase == .idle || phase == .animating, viewWhy: d.viewWhy(),
+                               hold: d.anchor.holdsForLanding)
+        // #713: asked in front, run after the switch: no landing in the background (`resyncAfterBackground`).
+        if why == "background" { d.metrics.skippedInBackground = true }
+        #if DEBUG
+        // #729: the landing that kept `now`'s place, with both ends and both heights, under `-vory-geometry-log`.
+        if why == "nowset", ThreadGeometryWatch.log {
+            Perf.stamp(String(format: "LAND nowset kept=%.1f uikitEnd=%.1f uikitH=%.1f swiftH=%.1f", set ?? -1, end,
+                              sv.contentSize.height, d.metrics.contentHeight))
+        }
+        #endif
         if why == nil { sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: end), animated: false) }
+    }
+}
+
+/// The past-end landing's two decisions as pure rules (#729), so they can be tested with the figures alone: what
+/// `LandBeforeCommit.now` and `.run` read goes in, and their decision comes out, in the same order of checks as before.
+/// No side effects; the callers set the offset (and `run` marks the background's skip). Every input is a read with no
+/// side effects (UIKit's figures, the thread's flags, the view's reason, the place keeper's hold), now all taken before
+/// the decision instead of as each check was reached.
+enum LandRule {
+    /// `LandBeforeCommit.now`: the offset it would set and why it doesn't (nil: it sets `target`). `live` is UIKit's
+    /// offset now, `from` and `end` the reading's own offset and end, `topInset` UIKit's adjusted top inset.
+    static func now(live: CGFloat, from: CGFloat, end: CGFloat, topInset: CGFloat, finger: Bool, idleOrAnimating: Bool,
+                    hold: String?) -> (target: CGFloat, why: String?) {
+        let target = max(-topInset, end)
+        let why: String?
+        if abs(live - from) >= 0.5 { why = "offsets" }
+        else if target >= live - 1 { why = "landed" }
+        else if finger { why = "finger" }
+        else if !idleOrAnimating { why = "phase" }
+        else { why = hold }
+        return (target, why)
+    }
+
+    /// `LandBeforeCommit.run`: why it doesn't set UIKit's end (nil: it sets it). `from` is UIKit's offset, `end` UIKit's
+    /// own end, `set` where `now` set the offset this turn (nil: it didn't), `locked` the thread's lock to its end.
+    static func run(from: CGFloat, end: CGFloat, set: CGFloat?, background: Bool, locked: Bool, finger: Bool,
+                    idleOrAnimating: Bool, viewWhy: String?, hold: String?) -> String? {
+        // Past the end: landed. Short of it: only after a set by `now` this turn, whose height UIKit didn't take.
+        if from <= end + 1, set == nil || from >= end - 1 { return "landed" }
+        if background { return "background" }
+        if !locked { return "unstuck" }
+        if finger { return "finger" }
+        if !idleOrAnimating { return "phase" }
+        if let viewWhy { return viewWhy }
+        if let hold { return hold }
+        // #729: after a set by `now` this turn, never past it. UIKit's end further on means UIKit still has a taller
+        // height than the reading `now` landed on; setting it put the thread past that reading's end, the next reading
+        // landed it back, and the two went on for good (58: 61338 and 59624, 1,714 pt apart, for 198 s). `now`'s place
+        // is kept. Pulled back to UIKit's end, as before, when `now`'s place is past it.
+        if let set, end > set + 1 { return "nowset" }
+        return nil
     }
 }
 #endif
