@@ -3100,6 +3100,13 @@ enum LandBeforeCommit {
                                hold: d.anchor.holdsForLanding)
         // #713: asked in front, run after the switch: no landing in the background (`resyncAfterBackground`).
         if why == "background" { d.metrics.skippedInBackground = true }
+        #if DEBUG
+        // #729: the landing that kept `now`'s place, with both ends and both heights, under `-vory-geometry-log`.
+        if why == "nowset", ThreadGeometryWatch.log {
+            Perf.stamp(String(format: "LAND nowset kept=%.1f uikitEnd=%.1f uikitH=%.1f swiftH=%.1f", set ?? -1, end,
+                              sv.contentSize.height, d.metrics.contentHeight))
+        }
+        #endif
         if why == nil { sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: end), animated: false) }
     }
 }
@@ -3135,7 +3142,13 @@ enum LandRule {
         if finger { return "finger" }
         if !idleOrAnimating { return "phase" }
         if let viewWhy { return viewWhy }
-        return hold
+        if let hold { return hold }
+        // #729: after a set by `now` this turn, never past it. UIKit's end further on means UIKit still has a taller
+        // height than the reading `now` landed on; setting it put the thread past that reading's end, the next reading
+        // landed it back, and the two went on for good (58: 61338 and 59624, 1,714 pt apart, for 198 s). `now`'s place
+        // is kept. Pulled back to UIKit's end, as before, when `now`'s place is past it.
+        if let set, end > set + 1 { return "nowset" }
+        return nil
     }
 }
 #endif
