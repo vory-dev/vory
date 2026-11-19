@@ -463,6 +463,55 @@ enum HomeTiles {
     static func split(frame: CGRect, fold: CGRect?, minimum: CGFloat) -> (leading: CGFloat, gap: CGFloat, trailing: CGFloat)? {
         FoldSplit.halves(frame: frame, fold: fold, minimum: minimum)
     }
+
+    /// A column of Home's two (#541) narrower than this keeps its tiles three to a row only below xxLarge.
+    static let narrowColumn: CGFloat = 480
+    /// The tiles in one of Home's two columns: no fold crosses it, so three to a row as on the phone; two from xxLarge in
+    /// a narrow column, where three cut their labels short (the Duo on its side, 355 pt, at xxxLarge: "Messag...",
+    /// "Top mo..."; the iPad's 500 held them whole).
+    static func inColumn(width: CGFloat, large: Bool) -> Int { large && width < narrowColumn ? 2 : 3 }
+}
+
+/// Home's fold up the window through a launch's first second (#720). The system reports the fold a beat after the
+/// window, and until then Home laid its tiles out three to a row, then slid them to two. Until the regions are read,
+/// Home lays out in the fold last seen for this window's shape (`SystemBarItems.shapeKey`), as the top bar does with its
+/// own (`TopBarRoom.barUpAtLaunch`); once they are, in the live ones. A shape never seen, or last seen with no fold up
+/// it, has nothing kept: the live regions, as before. Home's own key, apart from the top bar's.
+enum HomeLaunchFold {
+    static let storeKey = "home.upFoldByShape"
+
+    /// The regions Home lays out in: `live` once read; until then `live` with the kept fold, if any. `kept` is read only
+    /// while the regions are unread, so a page laid out after the first second reads no defaults.
+    static func regions(live: ReservedRegions, kept: @autoclosure () -> CGRect?) -> ReservedRegions {
+        guard live.reported.isEmpty, let kept = kept() else { return live }
+        var r = live
+        r.upFold = kept
+        return r
+    }
+
+    /// A fold worth keeping for a window of `size`: one up it, its full height, inside it. A read made while the window
+    /// still stood at the size remembered from the last launch (`SystemBarItems.settled`) doesn't fit that size and isn't
+    /// kept under its shape.
+    static func fits(_ fold: CGRect, in size: CGSize) -> Bool {
+        fold.height >= fold.width && abs(fold.height - size.height) < 1 && fold.minX > 0 && fold.maxX < size.width
+    }
+
+    static func kept(for shape: String, in defaults: UserDefaults = .standard) -> CGRect? {
+        guard let v = (defaults.dictionary(forKey: storeKey) as? [String: [Double]])?[shape], v.count == 4 else { return nil }
+        return CGRect(x: v[0], y: v[1], width: v[2], height: v[3])
+    }
+
+    /// A read of the regions for a window of `size` and `shape`, kept for the next launch: its fold up the window, or no
+    /// entry when it has none. Nothing before the regions are read, and nothing for a fold that doesn't fit the window.
+    static func note(_ regions: ReservedRegions, shape: String, size: CGSize, in defaults: UserDefaults = .standard) {
+        guard !regions.reported.isEmpty else { return }
+        if let fold = regions.upFold, !fits(fold, in: size) { return }
+        var all = defaults.dictionary(forKey: storeKey) as? [String: [Double]] ?? [:]
+        let value = regions.upFold.map { f -> [Double] in [f.minX, f.minY, f.width, f.height] }
+        guard all[shape] != value else { return }
+        all[shape] = value
+        defaults.set(all, forKey: storeKey)
+    }
 }
 
 /// Home on a window folded across (the Duo half open like a laptop, Duo stage 4): who's working above the fold, what
@@ -486,6 +535,36 @@ enum DeskSplit {
         let top = fold.minY - page.minY, bottom = page.maxY - fold.maxY
         guard top >= minTop, bottom >= minBottom else { return nil }
         return (top, fold.height, bottom)
+    }
+}
+
+/// Home in two columns on a wide window held wider than tall (#541): the open Duo on its side, flat or half open like a
+/// book, and an iPad in landscape. The columns' widths and the gap between them across `content` (the page inside its
+/// margins, window space), or nil for one column, as everywhere else: not a wide layout, a window taller than wide, an
+/// accessibility text size (as the desk's and voice mode's), Home being edited (the drag needs the one list), or a column
+/// under `minimum`. A fold up the window (active or not) across the content is the gap, so nothing stands on it and a hinge
+/// move never reflows Home. Both columns' edges stand on whole points clear of it: the leading column ends at or before
+/// the fold's near edge, the trailing one starts at or after its far edge (the Duo's fold is at half points, 455.5 to
+/// 495.5, and a half-point edge rounded onto the 3x grid ran 0.17 pt into it on the stills). Without a fold the columns
+/// are centred, each at most `maximum`, `spacing` apart. Decided by the window, its fold and the text size alone, never
+/// by what the cards hold, so no load or card change moves one across.
+enum HomeColumns {
+    /// The iPhone SE's card width (375 less 16 each side): the narrowest Home already lays out at.
+    static let minimum: CGFloat = 340
+    static let maximum: CGFloat = 500
+    static let spacing: CGFloat = 24
+
+    static func split(content: CGRect, window: CGSize, fold: CGRect?, wide: Bool, accessibilityText: Bool, editing: Bool) -> (leading: CGFloat, gap: CGFloat, trailing: CGFloat)? {
+        guard wide, window.width > window.height, !accessibilityText, !editing, content.width > 0 else { return nil }
+        if let fold, fold.maxX > content.minX, fold.minX < content.maxX {
+            guard fold.minX > content.minX, fold.maxX < content.maxX else { return nil }
+            let leading = (fold.minX - content.minX).rounded(.down), start = fold.maxX.rounded(.up)
+            let trailing = (content.maxX - start).rounded(.down)
+            guard leading >= minimum, trailing >= minimum else { return nil }
+            return (leading, start - content.minX - leading, trailing)
+        }
+        let column = min(maximum, ((content.width - spacing) / 2).rounded(.down))
+        return column >= minimum ? (column, spacing, column) : nil
     }
 }
 

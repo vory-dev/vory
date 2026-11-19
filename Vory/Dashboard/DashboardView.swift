@@ -15,6 +15,52 @@ enum HomeVisit {
     static func mark(kept: Double, visitStart: Double, inDemo: Bool) -> Double? { inDemo ? nil : max(kept, visitStart) }
 }
 
+/// Home's last numbers and chats, per gateway (#720): drawn from Home's first frame at a cold launch, where it stood
+/// empty until the load came, and replaced in place by the load. Small JSON in the standard defaults under its own
+/// prefix, apart from the chat lists' cache (`SessionCache`), whose clear and size in Settings cover it as well. Never
+/// the demo's or an in-process gateway's (#493), and taken away with its gateway (`AppModel.deleteConnection`).
+enum HomeCache {
+    static let prefix = "home.cache."
+
+    static func sessionsKey(connection: UUID, profile: String?, allBots: Bool) -> String {
+        prefix + "sessions." + connection.uuidString + "." + (profile ?? "-") + (allBots ? ".all" : ".one")
+    }
+    static func usageKey(connection: UUID, profile: String?, days: Int) -> String {
+        prefix + "usage." + connection.uuidString + "." + (profile ?? "-") + "." + String(days)
+    }
+
+    /// Whether a gateway's Home is kept: never the demo's, never one that runs in-process (`GatewayRuntime.isEphemeral`).
+    static func keeps(connection: UUID, ephemeral: Bool) -> Bool { !ephemeral && connection != GatewayConnection.demoID }
+
+    static func sessions(connection: UUID, profile: String?, allBots: Bool, ephemeral: Bool, in d: UserDefaults = .standard) -> [StoredSession]? {
+        guard keeps(connection: connection, ephemeral: ephemeral),
+              let data = d.data(forKey: sessionsKey(connection: connection, profile: profile, allBots: allBots)) else { return nil }
+        return try? JSONDecoder().decode([StoredSession].self, from: data)
+    }
+
+    static func usage(connection: UUID, profile: String?, days: Int, ephemeral: Bool, in d: UserDefaults = .standard) -> UsageAnalytics? {
+        guard keeps(connection: connection, ephemeral: ephemeral),
+              let data = d.data(forKey: usageKey(connection: connection, profile: profile, days: days)) else { return nil }
+        return try? JSONDecoder().decode(UsageAnalytics.self, from: data)
+    }
+
+    static func save(sessions: [StoredSession], connection: UUID, profile: String?, allBots: Bool, ephemeral: Bool, in d: UserDefaults = .standard) {
+        guard keeps(connection: connection, ephemeral: ephemeral), let data = try? JSONEncoder().encode(sessions) else { return }
+        d.set(data, forKey: sessionsKey(connection: connection, profile: profile, allBots: allBots))
+    }
+
+    static func save(usage: UsageAnalytics, connection: UUID, profile: String?, days: Int, ephemeral: Bool, in d: UserDefaults = .standard) {
+        guard keeps(connection: connection, ephemeral: ephemeral), let data = try? JSONEncoder().encode(usage) else { return }
+        d.set(data, forKey: usageKey(connection: connection, profile: profile, days: days))
+    }
+
+    /// Everything kept for one gateway, when it is removed.
+    static func forget(connection: UUID, in d: UserDefaults = .standard) {
+        let id = connection.uuidString
+        for k in d.dictionaryRepresentation().keys where k.hasPrefix(prefix) && k.contains(id) { d.removeObject(forKey: k) }
+    }
+}
+
 /// What Home's desk answers in place, and in what order (Duo stage 4, `DeskSplit`).
 enum DeskCards {
     /// An approval, with its choices. A question or a value prompt needs typing, and the keyboard would cover the half,
@@ -65,6 +111,11 @@ struct DashboardView: View {
     @Environment(\.reservedRegions) private var regions
     /// The tiles' span in the window, the width the card offers them (`OfferedWidth`), for the fold's place in it.
     @State private var tilesFrame = CGRect.zero
+    /// The tiles' columns as `HomeTiles` lays them out here, for `TileGrid`'s change in one frame (#720).
+    private var tilesKey: String {
+        let fold = homeRegions.upFold ?? homeRegions.verticalFold
+        return "\(HomeTiles.columns(regions: homeRegions)) \(fold.map { "\($0.minX) \($0.width)" } ?? "none") \(tilesFrame.minX) \(tilesFrame.width)"
+    }
     /// The page in the window (under our top bar's row, to the window's safe bottom), for the desk's halves.
     @State private var pageFrame = CGRect.zero
     #if os(iOS)
@@ -73,8 +124,17 @@ struct DashboardView: View {
     /// bar (its content margin keeps the last card clear), so `pageFrame` reaches the window's safe bottom; the desk's
     /// bottom half ends at the bar's top, as the chat's dock does.
     private var barReserve: CGFloat { model.tabBarReserved && !model.tabBarVertical ? VoryTabBar.reservedHeight(in: windowGeometry) : 0 }
+    /// The window's shape, for the fold Home keeps from one launch to the next (`HomeLaunchFold`).
+    private var shape: String {
+        SystemBarItems.shapeKey(size: windowGeometry.bounds.size, safeTop: windowGeometry.safeArea.top, safeTrailing: windowGeometry.safeArea.trailing)
+    }
+    /// The regions Home's tiles lay out in: the live ones, or through a launch's first second the fold last seen for this
+    /// window's shape (`HomeLaunchFold`, #720). The desk reads the live fold across, as before.
+    private var homeRegions: ReservedRegions { HomeLaunchFold.regions(live: regions, kept: HomeLaunchFold.kept(for: shape)) }
+    private func noteFold() { HomeLaunchFold.note(regions, shape: shape, size: windowGeometry.bounds.size) }
     #else
     private var barReserve: CGFloat { 0 }
+    private var homeRegions: ReservedRegions { regions }
     #endif
     /// The page the desk is laid in: `pageFrame` less our tab bar's reserve at its foot.
     private var deskPage: CGRect { CGRect(x: pageFrame.minX, y: pageFrame.minY, width: pageFrame.width, height: max(0, pageFrame.height - barReserve)) }
@@ -88,6 +148,29 @@ struct DashboardView: View {
     /// The idle bots' faces on the desk: 44 pt (from build 39's stills), 36 at the two largest text sizes short of
     /// the accessibility ones, so the row keeps clear of Who's working's rows and the fold. Hit areas stay at least 44.
     private var idleFace: CGFloat { typeSize >= .xxLarge ? 36 : 44 }
+    /// Home in two columns on a wide page held wider than tall (#541, `HomeColumns`), `page` in window space; nil for one
+    /// column, as everywhere else, and always on the desk. Read off the page as it is laid out (the body's geometry
+    /// reader), not off a frame measured afterwards, so a launch on its side draws two columns from its first frame:
+    /// the page's shape stands for the window's, which isn't read until after. The fold is the one Home lays out in
+    /// (`homeRegions`): through a launch's first second the one kept for this shape, so the columns' widths don't move
+    /// when the live fold comes (#720). iOS only: the Mac keeps its one column.
+    private func columns(page: CGRect) -> (leading: CGFloat, gap: CGFloat, trailing: CGFloat)? {
+        #if os(iOS)
+        guard desk == nil else { return nil }
+        return HomeColumns.split(content: page.insetBy(dx: 16, dy: 0), window: page.size,
+                                 fold: homeRegions.upFold ?? homeRegions.verticalFold, wide: wideLayout,
+                                 accessibilityText: typeSize.isAccessibilitySize, editing: editingHome)
+        #else
+        nil
+        #endif
+    }
+    @Environment(\.wideLayout) private var wideLayout
+    @Environment(\.scenePhase) private var scenePhase
+    /// The page `columns(page:)` reads, as last laid out outside the background, held while the scene is there
+    /// (`WindowGeometry.held`), as `wide` and the reserved regions are: the background's snapshot pass lays the window out
+    /// at another size (466 x 678 on the open Duo on its side), and read live there Home went to one column and back on
+    /// every trip, its cards built anew each way.
+    @State private var shownPage: CGRect?
     /// The gateway the last finished load ran against (see `shouldLoad`).
     @State private var loadedConnection: UUID?
 
@@ -107,48 +190,42 @@ struct DashboardView: View {
                 // accessibility audit as an element with no description, the fold's frame exactly.
                 deskTop.frame(height: desk.top, alignment: .top).padding(.bottom, desk.gap)
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    // On the desk the greeting stands in its top half, and what needs you opens the bottom one.
-                    if desk == nil { header() }
-                    // Home opens first on a restored device: the sign-in it still owes is asked for here too.
-                    if let waiting = model.needsSignIn { GatewaySignInBanner(connection: waiting) }
-                    if let runtime, desk != nil { deskNeedsYou(runtime) }
-                    else if let runtime, !runtime.needsAttention.isEmpty { needsYou(runtime) }
-                    // On the desk the bots stand in its top half, as who's working.
-                    ForEach(desk == nil ? layout.items : layout.items.filter { $0.card != .bots }) { item in
-                        editableCard(item)
-                            // While Home is being edited the press is a drag, so the menu stands
-                            // aside; otherwise a long press races the drag and the menu won.
-                            .contextMenu(menuItems: { if !editingHome { cardMenu(item) } })
-                    }
-                    if let error, model.needsSignIn == nil { Text(error).font(.footnote).foregroundStyle(.red).padding(.horizontal, 4) }
-                    // Edit: the cards can be dragged onto one another until Done; Settings has the
-                    // sizes, the hidden cards, the name and the opening tab.
-                    HStack(spacing: 10) {
-                        Button { withAnimation(.snappy) { editingHome.toggle() } } label: {
-                            Label(editingHome ? "Done" : "Edit Home", systemImage: editingHome ? "checkmark" : "arrow.up.arrow.down").font(.subheadline.weight(.medium))
-                                .frame(maxWidth: .infinity).padding(.vertical, 10)
+            // Home's columns are read off the page in the same layout pass that draws it (`columns(page:)`), so it
+            // never draws one column first; the page holds while the scene is in the background (`shownPage`).
+            GeometryReader { proxy in
+                let page = proxy.frame(in: .global)
+                let columns = self.columns(page: WindowGeometry.held(live: page, holding: scenePhase == .background, last: shownPage))
+                ScrollView {
+                    if let columns {
+                        twoColumns(columns)
+                    } else {
+                        VStack(alignment: .leading, spacing: 16) {
+                            // On the desk the greeting stands in its top half, and what needs you opens the bottom one.
+                            if desk == nil { header() }
+                            // Home opens first on a restored device: the sign-in it still owes is asked for here too.
+                            if let waiting = model.needsSignIn { GatewaySignInBanner(connection: waiting) }
+                            if let runtime, desk != nil { deskNeedsYou(runtime) }
+                            else if let runtime, !runtime.needsAttention.isEmpty { needsYou(runtime) }
+                            // On the desk the bots stand in its top half, as who's working.
+                            ForEach(desk == nil ? layout.items : layout.items.filter { $0.card != .bots }) { item in homeCard(item) }
+                            errorLine
+                            HStack(spacing: 10) { editHomeButton; homeSettingsButton }
+                                .padding(.top, 4)
+                            if editingHome {
+                                Text("Press, hold and drag a card onto another to put it there.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity)
+                            }
                         }
-                        .buttonStyle(.bordered).tint(editingHome ? Color.vory : .secondary)
-                        NavigationLink { HomeSettingsView().pushedPage() } label: {
-                            Label("Settings", systemImage: "slider.horizontal.3").font(.subheadline.weight(.medium))
-                                .frame(maxWidth: .infinity).padding(.vertical, 10)
-                        }
-                        .buttonStyle(.bordered).tint(.secondary)
-                    }
-                    .padding(.top, 4)
-                    if editingHome {
-                        Text("Press, hold and drag a card onto another to put it there.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity)
+                        .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 24)
+                        .animation(.snappy, value: layoutRaw)
+                        // A reading width in the middle of a wide window, not cards the width of the screen.
+                        .readingColumn(640)
                     }
                 }
-                .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 24)
-                .animation(.snappy, value: layoutRaw)
-                // A reading width in the middle of a wide window, not cards the width of the screen.
-                .readingColumn(640)
+                .scrollPosition($scrollPosition)
+                .reloadable { await Task { await load(); await summarizeSince(force: true) }.value }
+                .onChange(of: page, initial: true) { _, p in if scenePhase != .background { shownPage = p } }
+                .onChange(of: scenePhase) { _, phase in if phase != .background { shownPage = page } }
             }
-            .scrollPosition($scrollPosition)
-            .reloadable { await Task { await load(); await summarizeSince(force: true) }.value }
         }
         // The desk comes and goes in one frame. The system changes the posture inside an animation, and with it the
         // scroll's frame glided from the fold up to the page's top going flat, the greeting passing mid-screen (seen on
@@ -160,7 +237,20 @@ struct DashboardView: View {
         // already half open shows the desk from its first frame.
         .onAppear { deskFold = regions.horizontalFold }
         .onChange(of: regions.horizontalFold) { _, fold in Task { @MainActor in deskFold = fold } }
+        #if os(iOS)
+        // Each read of the regions, kept for the next launch's first second (`HomeLaunchFold`).
+        .onChange(of: regions, initial: true) { _, _ in noteFold() }
+        .onChange(of: shape) { _, _ in noteFold() }
+        #endif
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { pageFrame = $0 }
+        #if DEBUG && os(iOS)
+        .overlay(alignment: .topTrailing) {
+            if Self.columnsProbe {
+                Text(columnsReadout).font(.system(size: 1)).opacity(0.01).frame(width: 1, height: 1)
+                    .accessibilityIdentifier("home.columns").accessibilityLabel(columnsReadout)
+            }
+        }
+        #endif
         #if DEBUG
         .overlay(alignment: .topLeading) {
             if Self.deskProbe {
@@ -187,6 +277,8 @@ struct DashboardView: View {
             // gateway did not answer (the launch load before the route is up) loads again.
             if Self.counts(cancelled: Task.isCancelled, hasGateway: runtime != nil, gotList: gotList) { loadedKey = key; loadedConnection = connection }
         }
+        // The last numbers and chats from Home's first frame, as soon as a gateway is there (`showKept`, #720).
+        .onChange(of: "\(runtime?.connection.id.uuidString ?? "")|\(runtime?.selectedProfile ?? "")|\(rangeDays)|\(homeAllBots)", initial: true) { _, _ in showKept() }
         .onAppear { visitStart = Date().timeIntervalSince1970 }
         .onDisappear { markVisit(); editingHome = false }
         .onChange(of: pageShown) { _, shown in
@@ -224,6 +316,84 @@ struct DashboardView: View {
                                 }
                             }
                             Button(role: .destructive) { withAnimation(.snappy) { update { $0.remove(item.card) } } } label: { Label("Hide from Home", systemImage: "eye.slash") }
+    }
+
+    /// A card as Home lays it, with its menu.
+    private func homeCard(_ item: HomeLayout.Item) -> some View {
+        editableCard(item)
+            // While Home is being edited the press is a drag, so the menu stands
+            // aside; otherwise a long press races the drag and the menu won.
+            .contextMenu(menuItems: { if !editingHome { cardMenu(item) } })
+    }
+
+    @ViewBuilder private var errorLine: some View {
+        if let error, model.needsSignIn == nil { Text(error).font(.footnote).foregroundStyle(.red).padding(.horizontal, 4) }
+    }
+
+    // Edit: the cards can be dragged onto one another until Done; Settings has the
+    // sizes, the hidden cards, the name and the opening tab.
+    private var editHomeButton: some View {
+        Button { withAnimation(.snappy) { editingHome.toggle() } } label: {
+            Label(editingHome ? "Done" : "Edit Home", systemImage: editingHome ? "checkmark" : "arrow.up.arrow.down").font(.subheadline.weight(.medium))
+                .frame(maxWidth: .infinity).padding(.vertical, 10)
+        }
+        .buttonStyle(.bordered).tint(editingHome ? Color.vory : .secondary)
+    }
+
+    private var homeSettingsButton: some View {
+        NavigationLink { HomeSettingsView().pushedPage() } label: {
+            Label("Settings", systemImage: "slider.horizontal.3").font(.subheadline.weight(.medium))
+                .frame(maxWidth: .infinity).padding(.vertical, 10)
+        }
+        .buttonStyle(.bordered).tint(.secondary)
+    }
+
+    // MARK: Two columns (#541)
+
+    /// The cards on the left (you: the chats); the rest stand on the right (your bots: the Overview and Bots).
+    private static let leftCards: Set<HomeCard> = [.pickUp, .since]
+
+    /// The sign-in Home still owes, and the chats waiting on the person.
+    @ViewBuilder private var attention: some View {
+        if let waiting = model.needsSignIn { GatewaySignInBanner(connection: waiting) }
+        if let runtime, !runtime.needsAttention.isEmpty { needsYou(runtime) }
+    }
+
+    /// Home in two columns (`HomeColumns`, #541, layout A), the cards as they are in one: you on the left (the
+    /// greeting, what needs you, then Pick up and Since), your bots on the right (the Overview, then Bots), each side in
+    /// the Settings order; a card never changes side. Edit Home under the left column and Settings under the right, the
+    /// fold the gap between them on the Duo. Each column is read whole by VoiceOver, the left first.
+    private func twoColumns(_ c: (leading: CGFloat, gap: CGFloat, trailing: CGFloat)) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: c.gap) {
+                VStack(alignment: .leading, spacing: 16) {
+                    header()
+                    attention
+                    ForEach(layout.items.filter { Self.leftCards.contains($0.card) }) { item in homeCard(item) }
+                    errorLine
+                }
+                .frame(width: c.leading, alignment: .topLeading)
+                .environment(\.homeColumnWidth, c.leading)
+                .accessibilityElement(children: .contain).accessibilitySortPriority(1)
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(layout.items.filter { !Self.leftCards.contains($0.card) }) { item in homeCard(item) }
+                }
+                .frame(width: c.trailing, alignment: .topLeading)
+                .environment(\.homeColumnWidth, c.trailing)
+                .accessibilityElement(children: .contain)
+            }
+            HStack(alignment: .top, spacing: c.gap) {
+                editHomeButton.frame(width: c.leading)
+                homeSettingsButton.frame(width: c.trailing)
+            }
+            .padding(.top, 4)
+        }
+        .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 24)
+        .animation(.snappy, value: layoutRaw)
+        .frame(maxWidth: .infinity)
+        #if DEBUG
+        .onAppear { probeColumnsBuilt += 1 }
+        #endif
     }
 
     /// The card, and while Home is being edited, a drag source and a drop target with a dashed
@@ -455,9 +625,22 @@ struct DashboardView: View {
     /// how many loads have run (a posture change must add none), read by the hinge legs as `desk.frames`' label. Checked
     /// absent from Release.
     private static let deskProbe = ProcessInfo.processInfo.arguments.contains("-vory-desk-frames")
+    #if os(iOS)
+    /// DEBUG `-vory-columns-frames` (#541): Home's columns (leading, gap, trailing, or none), the fold up the window
+    /// (active or not), the page, the window, and how many times the two columns have been built (a trip to the
+    /// background and back must not build them again), as `home.columns`' label, for HomeColumnsUITests. Checked absent
+    /// from Release.
+    private static let columnsProbe = ProcessInfo.processInfo.arguments.contains("-vory-columns-frames")
+    private var columnsReadout: String {
+        func r(_ f: CGRect) -> String { String(format: "%.1f %.1f %.1f %.1f", f.minX, f.minY, f.width, f.height) }
+        let c = columns(page: pageFrame).map { String(format: "%.1f %.1f %.1f", $0.leading, $0.gap, $0.trailing) } ?? "none"
+        return "columns \(c);upfold \((homeRegions.upFold ?? homeRegions.verticalFold).map(r) ?? "none");page \(r(pageFrame));window \(String(format: "%.0f %.0f", windowGeometry.bounds.width, windowGeometry.bounds.height));built \(probeColumnsBuilt)"
+    }
+    #endif
     @State private var probePanel: CGRect = .zero
     @State private var probeCards: CGRect = .zero
     @State private var probeLoads = 0
+    @State private var probeColumnsBuilt = 0
     private var deskReadout: String {
         func r(_ f: CGRect) -> String { String(format: "%.1f %.1f %.1f %.1f", f.minX, f.minY, f.width, f.height) }
         return "page \(r(deskPage));panel \(r(probePanel));cards \(r(probeCards));fold \(regions.horizontalFold.map(r) ?? "none");split \(desk == nil ? "no" : "yes");loads \(probeLoads)"
@@ -491,9 +674,9 @@ struct DashboardView: View {
             // where four left a short second row on the Mac. Two to a row on a window that can
             // fold, so a fold up the middle falls between the tiles (`HomeTiles`, Duo stage 2).
             // The span the fold's place is read against is the width the card offers the tiles, whatever their columns
-            // add up to (`OfferedWidth`).
+            // add up to (`OfferedWidth`). In one of Home's two columns (#541) no fold crosses the grid (`TileGrid`).
             OfferedWidth {
-                LazyVGrid(columns: HomeTiles.items(regions: regions, frame: tilesFrame, spacing: 8), spacing: 8) {
+                TileGrid(others: HomeTiles.items(regions: homeRegions, frame: tilesFrame, spacing: 8), othersKey: tilesKey) {
                     tile("Sessions", t.map { Format.count($0.totalSessions ?? 0) } ?? Format.count(periodSessions.count))
                     tile("Messages", Format.count(messages))
                     tile("Tokens", tokens > 0 ? Format.tokens(tokens) : "–")
@@ -729,7 +912,9 @@ struct DashboardView: View {
                 }
             }
         })
-        .task(id: "\(changedSinceVisit.map(\.id).joined())|\(pageLive)") { if pageLive { await summarizeSince(force: false) } }
+        // Summed up from a load's chats, never the kept ones (`HomeCache`, #720): a summary made from those stood after the
+        // load, as one is made only once unless forced.
+        .task(id: "\(changedSinceVisit.map(\.id).joined())|\(pageLive)|\(loadedKey.isEmpty)") { if pageLive, !loadedKey.isEmpty { await summarizeSince(force: false) } }
     }
 
     private func summarizeSince(force: Bool) async {
@@ -791,6 +976,7 @@ struct DashboardView: View {
         #endif
         // The gateway caps a page at 100 (a larger ask is refused outright).
         let allBots = homeAllBots
+        let profile = rt.selectedProfile, days = rangeDays
         async let u: (UsageAnalytics?, keep: Bool) = Self.usage(rt, days: rangeDays)
         async let s: [StoredSession]? = try? Self.chats(rt, allBots: allBots)
         let (usageResult, list) = await (u, s)
@@ -805,7 +991,25 @@ struct DashboardView: View {
             else if sessions.isEmpty { error = "Could not load the chat list." }
         }
         if let a = usageResult.0 { Self.keepForWidgets(a, sessions: list, runtime: rt) }
+        // Kept for the next cold launch (`HomeCache`, #720), from a load that wasn't cut short and whose gateway is still
+        // the one in use (one removed meanwhile keeps nothing). A gateway that answered without the analytics API keeps
+        // no numbers, as the card shows none.
+        if !Task.isCancelled, runtime?.connection.id == rt.connection.id {
+            let c = rt.connection.id
+            if let list { HomeCache.save(sessions: list, connection: c, profile: profile, allBots: allBots, ephemeral: rt.isEphemeral) }
+            if let a = usageResult.0 { HomeCache.save(usage: a, connection: c, profile: profile, days: days, ephemeral: rt.isEphemeral) }
+            else if !usageResult.keep { UserDefaults.standard.removeObject(forKey: HomeCache.usageKey(connection: c, profile: profile, days: days)) }
+        }
         return list != nil
+    }
+
+    /// Home's last numbers and chats (`HomeCache`, #720), shown until the first load replaces them in place. Only while
+    /// nothing has loaded yet: after that a change of bot or range shows what it showed until its own load lands, as before.
+    private func showKept() {
+        guard let rt = runtime, loadedKey.isEmpty, usage == nil, sessions.isEmpty else { return }
+        let c = rt.connection.id, p = rt.selectedProfile
+        if let list = HomeCache.sessions(connection: c, profile: p, allBots: homeAllBots, ephemeral: rt.isEphemeral) { sessions = list }
+        if let a = HomeCache.usage(connection: c, profile: p, days: rangeDays, ephemeral: rt.isEphemeral) { usage = a }
     }
 
     /// The month's numbers into the shared snapshot the Overview widget and complications draw from: a gateway's own,
@@ -818,12 +1022,38 @@ struct DashboardView: View {
     }
 }
 
+extension EnvironmentValues {
+    /// The width of the column of Home's two (#541) a card stands in; nil in one column, as everywhere else.
+    @Entry var homeColumnWidth: CGFloat? = nil
+}
+
+/// Home's six tiles: in one of Home's two columns (`homeColumnWidth`, #541) no fold crosses them, so three to a row as on
+/// the phone, two from xxLarge in a narrow column (`HomeTiles.inColumn`); elsewhere `others` (`HomeTiles.items`), which
+/// `othersKey` names. A change of columns lands in one frame (#720): the fold is reported inside the system's own
+/// animation, and the tiles slid from three to a row to two, over one another, as the numbers came.
+private struct TileGrid<Content: View>: View {
+    @Environment(\.homeColumnWidth) private var column
+    @Environment(\.dynamicTypeSize) private var typeSize
+    var others: [GridItem]
+    var othersKey: String
+    @ViewBuilder var content: Content
+    var body: some View {
+        let inColumn = column.map { HomeTiles.inColumn(width: $0, large: typeSize >= .xxLarge) }
+        LazyVGrid(columns: inColumn.map { EvenColumns.items($0, spacing: 8) } ?? others, spacing: 8) {
+            content
+        }
+        .transaction(value: inColumn.map { "column \($0)" } ?? othersKey) { $0.animation = nil }
+    }
+}
+
 /// The last `weeks` weeks as blocks, one column per week, one row per weekday, darker for busier
 /// days (sessions started that day). Like the usage blocks in a coding terminal.
 struct ActivityGrid: View {
     var daily: [UsageAnalytics.Day]
     var sessions: [StoredSession]
     var weeks: Int
+    /// In one of Home's two columns (#541) at most 22 pt a block, as on the Mac: an iPad's column made them 33.
+    @Environment(\.homeColumnWidth) private var column
 
     private var counts: [Date: Int] {
         let cal = Calendar.current
@@ -857,6 +1087,9 @@ struct ActivityGrid: View {
                                 .fill(future ? Color.clear : (n == 0 ? Color.primary.opacity(0.07) : Color.vory.opacity(0.25 + 0.75 * min(1, Double(n) / Double(peak)))))
                                 .aspectRatio(1, contentMode: .fit)
                                 .accessibilityLabel(future ? "" : "\(day.formatted(date: .abbreviated, time: .omitted)): \(n) sessions")
+                                // A day still to come is a blank square, not an element: in one of Home's two columns
+                                // (#541) VoiceOver and the audit met it as an element with no description.
+                                .accessibilityHidden(future)
                         }
                     }
                 }
@@ -871,6 +1104,8 @@ struct ActivityGrid: View {
         #if os(macOS)
         // Blocks the size of a terminal's, not of a window: at most 22 pt each.
         .frame(maxWidth: CGFloat(weeks) * 22 + CGFloat(weeks - 1) * 3, alignment: .leading)
+        #else
+        .frame(maxWidth: column != nil ? CGFloat(weeks) * 22 + CGFloat(weeks - 1) * 3 : nil, alignment: .leading)
         #endif
     }
 }

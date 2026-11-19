@@ -50,6 +50,18 @@ enum AppFingerprint {
                 out.append("ids.\(k)=\(ids.isEmpty ? "none" : ids)")
                 continue
             }
+            // Home's kept chats (`HomeCache`, #720) count the same way. Its kept numbers count by being there: the gateway's
+            // own, rewritten by every load. So a replay that wrote the demo's numbers under a gateway's key wouldn't show
+            // here; HomeCache's units hold that it never writes for the demo (DemoNoTraceTests).
+            if k.hasPrefix(HomeCache.prefix + "sessions."), let ids = sessionIDs(v) {
+                out.append("defaults.\(k)=\(hash(ids))")
+                out.append("ids.\(k)=\(ids.isEmpty ? "none" : ids)")
+                continue
+            }
+            if k.hasPrefix(HomeCache.prefix + "usage.") {
+                out.append("defaults.\(k)=kept")
+                continue
+            }
             out.append("defaults.\(k)=\(hash(canonical(v)))")
         }
         let gateways = model.store.connections.map { "\($0.id.uuidString):\($0.name)" }.sorted().joined(separator: ",")

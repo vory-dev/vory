@@ -717,6 +717,8 @@ final class AppModel {
             await deactivate()
         }
         store.delete(id: id)
+        // Home's last numbers and chats go with their gateway (`HomeCache`, #720).
+        HomeCache.forget(connection: id)
         if let next = store.active { await activate(next) }
         #if os(iOS)
         WatchSync.shared.push(store: store)
