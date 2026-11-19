@@ -1272,17 +1272,24 @@ extension TranscriptView {
         noteLanding()
         var still = Transaction()
         still.disablesAnimations = true
-        withTransaction(still) { scrollPosition.scrollTo(edge: .bottom) }
-        // In the update that changed the content's height, UIKit still has the old height, and the scroll above lands
-        // against it: it moves nothing, and the thread was drawn past its end for a frame (a tool turn's rows folding as
-        // the next prompt went out, a 570 pt flash and back) until the next reading landed it. Locked to the end before
-        // this change (`locked` is read before this reading's own lock below it), the end is set in UIKit at once, in
-        // this same update, from this reading's own offset and distance (`LandBeforeCommit.now`), so the commit that
-        // carries the change carries the landing; and checked again just before the next commit against UIKit's own end
-        // (`LandBeforeCommit.ask`).
+        // In the update that changed the content's height, UIKit still has the old height, and the scroll to the bottom
+        // edge below lands against it: it moves nothing, and the thread was drawn past its end for a frame (a tool
+        // turn's rows folding as the next prompt went out, a 570 pt flash and back) until the next reading landed it.
+        // Locked to the end before this change (`locked` is read before this reading's own lock below it), the end is
+        // set in UIKit at once, in this same update, from this reading's own offset and distance
+        // (`LandBeforeCommit.now`), so the commit that carries the change carries the landing; and checked again just
+        // before the next commit against UIKit's own end (`LandBeforeCommit.ask`).
+        // #729: when `now` has set the end here, there is no scroll to the bottom edge as well. The two ends differ while
+        // UIKit's content size is still apart from the reading's: the edge is UIKit's (its content size), `now`'s is the
+        // reading's. Both in one landing, each set the thread past the other's end, and the next reading landed it
+        // again, for good: a chat on 58 opened hidden and stayed so (14,161 and 14,183 pt, 22 apart, about 1,000 times
+        // a second for 193 s, 2026-11-19); #729's loop on 58 had the same scroll to the edge in every turn. Where `now`
+        // doesn't set (another offset, a finger, a scroll in flight, the place keeper's hold, no reading's offset), the
+        // scroll to the edge is as before.
         #if os(iOS)
+        var setNow = false
         if ThreadFix.on, locked, let sv = metrics.scrollView, abs(sv.contentSize.height - metrics.contentHeight) >= 0.5 {
-            if let offset { LandBeforeCommit.now(sv, metrics, anchor, end: offset + distance, from: offset) }
+            if let offset { setNow = LandBeforeCommit.now(sv, metrics, anchor, end: offset + distance, from: offset) }
             LandBeforeCommit.ask(sv, metrics, anchor) {
                 if Date() <= overscrollEaseUntil { return "eased" }
                 if CardHold.shared.holding { return "card" }
@@ -1290,7 +1297,10 @@ extension TranscriptView {
                 return nil
             }
         }
+        #else
+        let setNow = false
         #endif
+        if !setNow { withTransaction(still) { scrollPosition.scrollTo(edge: .bottom) } }
     }
 
     /// The away flags after the distance changed. Under the fix (`ThreadFix`), decided once a run-loop turn, just before
@@ -3065,15 +3075,17 @@ enum LandBeforeCommit {
     private static var early: [ObjectIdentifier: CGFloat] = [:]
 
     /// In the update that found the thread past its end (see the type's comment). `end` and `from` are the reading's own.
-    static func now(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, end: CGFloat, from: CGFloat) {
+    /// True when it set the offset (#729: the caller then doesn't also scroll to the bottom edge).
+    @discardableResult
+    static func now(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, end: CGFloat, from: CGFloat) -> Bool {
         let phase = anchor.phaseNow
         let d = LandRule.now(live: sv.contentOffset.y, from: from, end: end, topInset: sv.adjustedContentInset.top,
                              finger: metrics.userScrolling, idleOrAnimating: phase == .idle || phase == .animating,
                              hold: anchor.holdsForLanding)
-        if d.why == nil {
-            sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: d.target), animated: false)
-            early[ObjectIdentifier(sv)] = d.target
-        }
+        guard d.why == nil else { return false }
+        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: d.target), animated: false)
+        early[ObjectIdentifier(sv)] = d.target
+        return true
     }
 
     static func ask(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, viewWhy: @escaping @MainActor () -> String?) {
