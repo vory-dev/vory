@@ -65,14 +65,30 @@ struct ConversationView: View {
     /// measured.
     private var restingDockBottom: CGFloat? {
         ReplyBarRules.restingDockBottom(windowHeight: windowGeometry.bounds.height, safeBottom: windowGeometry.safeArea.bottom,
-                                        barReserve: barReserve)
+                                        barReserve: barReserve, noBarBelowWide: noBarBelowWide)
     }
+    /// #731: a wide window (the chat beside the list, or opened from Home) with no tab bar under the chat. The bar rests
+    /// lower there (`ReplyBarRules.wideDrop`): nothing at the bottom to rest level with.
+    private var noBarBelowWide: Bool { wide && barReserve == 0 }
     /// 59: the dock's shift below 57's place at rest (`ReplyBarRules.dockShift`): negative on a phone with a home
     /// indicator, 0 with the keyboard up or the tab bar under the chat.
     private var dockShift: CGFloat {
         ReplyBarRules.dockShift(safeBottom: windowGeometry.safeArea.bottom, keyboardUp: windowGeometry.keyboardOverlap > 0,
-                                barBelow: barReserve > 0)
+                                barBelow: barReserve > 0, noBarBelowWide: noBarBelowWide)
     }
+    #if DEBUG
+    /// #731's measure: the dock's rest terms on a 1 pt element (`debug.dockrest`), with `-vory-dock-rest` only.
+    static let dockRestOn = ProcessInfo.processInfo.arguments.contains("-vory-dock-rest")
+    private var dockRestReadout: String {
+        let g = windowGeometry
+        func n(_ v: CGFloat) -> String { String(format: "%.1f", v) }
+        return "safeBottom \(n(g.safeArea.bottom));overhang \(n(ReplyBarRules.overhang));gap \(n(ReplyBarRules.gap))"
+            + ";barReserve \(n(barReserve));vertical \(model.tabBarVertical ? 1 : 0);wide \(wide ? 1 : 0);foldLift \(n(foldLift))"
+            + ";noBarBelowWide \(noBarBelowWide ? 1 : 0);dockShift \(n(dockShift))"
+            + ";restingGap \(n(ReplyBarRules.restingGap(safeBottom: g.safeArea.bottom, noBarBelowWide: noBarBelowWide)))"
+            + ";slotBottom \(n(dockSlotBottom));window \(n(g.bounds.height));keyboard \(n(g.keyboardOverlap))"
+    }
+    #endif
     #endif
     /// The floating header's height on iOS; the Mac's header is the window toolbar, outside the thread.
     #if os(macOS)
@@ -325,6 +341,12 @@ struct ConversationView: View {
             // as the fallback (`keyboardOverlap`, the window's number, unanimated).
             thread(chat)
                 .ignoresSafeArea(.keyboard, edges: .bottom)
+            #if DEBUG
+            if Self.dockRestOn {
+                Color.clear.frame(width: 1, height: 1).allowsHitTesting(false)
+                    .accessibilityElement().accessibilityIdentifier("debug.dockrest").accessibilityLabel(dockRestReadout)
+            }
+            #endif
             // The dock is a sibling, not an overlay of the thread: it sits in the keyboard's own
             // safe area and rides the keyboard's animation (2026-10-11: the bar "lags
             // behind the keyboard opening and closing", "the keyboard collapses completely

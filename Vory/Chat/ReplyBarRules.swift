@@ -60,29 +60,39 @@ enum ReplyBarRules {
     /// The gap above the keyboard, above Vory's tab bar, or above the screen's edge with no home indicator.
     static let gap: CGFloat = 8
 
-    /// The bar's bottom edge above the window's bottom edge, at rest: `max(8, safeBottom - 13)`. With the keyboard up, or
-    /// with Vory's tab bar under the chat (the bar along the bottom), it stands 8 pt above them instead, as before.
-    static func restingGap(safeBottom: CGFloat) -> CGFloat { max(gap, safeBottom - overhang) }
+    /// #731: how far the bar rests into the home-indicator area on a wide window with no bar under the chat
+    /// (`noBarBelowWide`: the chat beside the list, or opened from Home, on the iPhone Duo on its side or an iPad). There
+    /// is no tab bar capsule there to rest level with, and the list beside it runs to the edge: on the Duo's 34 pt it
+    /// rests 13 pt above the edge (21 on a phone). Never under `gap`.
+    static let wideDrop: CGFloat = 21
+
+    /// The bar's bottom edge above the window's bottom edge, at rest: `max(8, safeBottom - 13)`, or with `noBarBelowWide`
+    /// (#731) `max(8, safeBottom - 21)`. With the keyboard up, or with Vory's tab bar under the chat (the bar along the
+    /// bottom), it stands 8 pt above them instead, as before.
+    static func restingGap(safeBottom: CGFloat, noBarBelowWide: Bool = false) -> CGFloat {
+        max(gap, safeBottom - (noBarBelowWide ? wideDrop : overhang))
+    }
 
     /// The dock's bottom padding inside the keyboard's safe area: `gap` with the keyboard up or a bar under it; at rest, the
     /// resting gap less the safe area it stands in (negative on a phone with a home indicator: down into that area).
-    static func dockBottomPadding(safeBottom: CGFloat, keyboardUp: Bool, barBelow: Bool) -> CGFloat {
-        keyboardUp || barBelow ? gap : restingGap(safeBottom: safeBottom) - safeBottom
+    static func dockBottomPadding(safeBottom: CGFloat, keyboardUp: Bool, barBelow: Bool, noBarBelowWide: Bool = false) -> CGFloat {
+        keyboardUp || barBelow ? gap : restingGap(safeBottom: safeBottom, noBarBelowWide: noBarBelowWide) - safeBottom
     }
 
     /// The dock's padding beyond the 8 pt `BottomDock` keeps below the card itself (`BottomDock.bottomPadding`): 0 with the
     /// keyboard up or a bar under it, and at rest the resting place less those 8 (−21 on a 34 pt phone: down into the
-    /// home-indicator area).
-    static func dockShift(safeBottom: CGFloat, keyboardUp: Bool, barBelow: Bool) -> CGFloat {
-        dockBottomPadding(safeBottom: safeBottom, keyboardUp: keyboardUp, barBelow: barBelow) - gap
+    /// home-indicator area; −29 on the side Duo with no bar under the chat, #731).
+    static func dockShift(safeBottom: CGFloat, keyboardUp: Bool, barBelow: Bool, noBarBelowWide: Bool = false) -> CGFloat {
+        dockBottomPadding(safeBottom: safeBottom, keyboardUp: keyboardUp, barBelow: barBelow, noBarBelowWide: noBarBelowWide) - gap
     }
 
     /// Where the dock's bottom edge stands with no keyboard and no lift (window space): the safe area's bottom, less the
     /// bar's reserve, less the shift. Nil until the window is measured. The fold lift (`ConversationView.foldLift`) works
-    /// from it.
-    static func restingDockBottom(windowHeight: CGFloat, safeBottom: CGFloat, barReserve: CGFloat) -> CGFloat? {
+    /// from it, so it takes the same `noBarBelowWide` as the shift (#731).
+    static func restingDockBottom(windowHeight: CGFloat, safeBottom: CGFloat, barReserve: CGFloat, noBarBelowWide: Bool = false) -> CGFloat? {
         guard windowHeight > 0 else { return nil }
-        return windowHeight - safeBottom - barReserve - dockShift(safeBottom: safeBottom, keyboardUp: false, barBelow: barReserve > 0)
+        return windowHeight - safeBottom - barReserve
+            - dockShift(safeBottom: safeBottom, keyboardUp: false, barBelow: barReserve > 0, noBarBelowWide: noBarBelowWide)
     }
 
     // MARK: Hold to dictate

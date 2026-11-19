@@ -116,6 +116,34 @@ import Testing
         #expect(slot - w.2 - shift == R.restingDockBottom(windowHeight: w.0, safeBottom: w.1, barReserve: w.2))
     }
 
+    /// #731: a wide window with no tab bar under the chat rests lower, 13 pt above the edge on the Duo's 34 pt; every
+    /// other place as #731's step 0 measured it (the bar's gap above the window's edge, from the dock's own readout).
+    @Test func aWideWindowWithNoBarBelowRestsLower() {
+        // The iPhone Duo on its side (951 x 669, 34 pt): 13 above the edge (21 before #731).
+        #expect(R.restingGap(safeBottom: 34, noBarBelowWide: true) == 13)
+        #expect(R.dockBottomPadding(safeBottom: 34, keyboardUp: false, barBelow: false, noBarBelowWide: true) == -21)
+        #expect(R.dockShift(safeBottom: 34, keyboardUp: false, barBelow: false, noBarBelowWide: true) == -29)
+        // The dock at 664, the card's edge 8 above it at 656: 13 above the window's 669.
+        #expect(R.restingDockBottom(windowHeight: 669, safeBottom: 34, barReserve: 0, noBarBelowWide: true) == 664)
+        // Measured unchanged: the 17 Pro 21 and the SE 8 (never wide), an iPad from Home 8 (20 pt: never under the gap),
+        // an iPad beside the list 8 above its tab bar (43 + 20 + 8 = 71 from the edge).
+        #expect(R.restingGap(safeBottom: 34) == 21)
+        #expect(R.restingGap(safeBottom: 0) == 8)
+        #expect(R.restingGap(safeBottom: 20, noBarBelowWide: true) == 8)
+        #expect(R.dockBottomPadding(safeBottom: 20, keyboardUp: false, barBelow: true) == 8)
+        // The keyboard up keeps its 8 pt above the keys there too; a bar under the chat wins over the wide rest.
+        #expect(R.dockBottomPadding(safeBottom: 34, keyboardUp: true, barBelow: false, noBarBelowWide: true) == 8)
+        #expect(R.dockBottomPadding(safeBottom: 34, keyboardUp: false, barBelow: true, noBarBelowWide: true) == 8)
+        #expect(R.wideDrop == 21)
+    }
+
+    /// The fold lift's two reads still agree at rest on a wide window with no bar below (documentation, as above).
+    @Test(arguments: [(CGFloat(669), CGFloat(34)), (1180, 20), (820, 20)])
+    func theLiftsReadsAgreeOnAWideWindow(_ w: (CGFloat, CGFloat)) {
+        let shift = R.dockShift(safeBottom: w.1, keyboardUp: false, barBelow: false, noBarBelowWide: true)
+        #expect(w.0 - w.1 - shift == R.restingDockBottom(windowHeight: w.0, safeBottom: w.1, barReserve: 0, noBarBelowWide: true))
+    }
+
     // MARK: Hold to dictate
 
     /// Only on the pill: never on a focused field (its selection, cursor and edit menu stay as they are).

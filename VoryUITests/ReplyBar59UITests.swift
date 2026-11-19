@@ -32,10 +32,10 @@ final class ReplyBar59UITests: XCTestCase {
 
     /// The demo, the fake dictation (`fakeWords`), and the test's extras.
     /// `scheme` sets light or dark through the arguments domain (testPlaceholderContrast, testOpenRow).
-    private func launch(_ extra: [String] = [], scheme: String = "light") throws {
+    private func launch(_ extra: [String] = [], scheme: String = "light", tab: String = "chats") throws {
         guard let bundle = env["HERMES_E2E_BUNDLE"], !bundle.isEmpty else { throw XCTSkip("HERMES_E2E_BUNDLE not set") }
         app = XCUIApplication(bundleIdentifier: bundle)
-        var args = ["-vory-demo", "-companionPromptShown", "YES", "-launchTab", "chats", "-colorSchemePreference", scheme]
+        var args = ["-vory-demo", "-companionPromptShown", "YES", "-launchTab", tab, "-colorSchemePreference", scheme]
         if !base57 { args += ["-vory-fake-dictation", fakeWords] }
         // The probe: HoldToDictate's HOLDG stamps in the perf log, and with R59_NO_PRESS=1 no press scale.
         if env["R59_PROBE"] == "1", !extra.contains("-vory-geometry-log") { args += ["-vory-geometry-log"] }
@@ -177,6 +177,62 @@ final class ReplyBar59UITests: XCTestCase {
         let gap = win.maxY - dock.maxY
         say("REST dock \(f(dock)) window \(f(win)) cardGap \(String(format: "%.1f", gap)) tabbar \(el("tabbar").exists ? f(el("tabbar").frame) : "none")")
         if let want = env["R59_REST_GAP"].flatMap(Double.init) { XCTAssertEqual(gap, want, accuracy: 1, "the card's gap above the window's edge") }
+    }
+
+    /// #731: the bar's rest place with the dock's terms off its DEBUG readout (`-vory-dock-rest`, `debug.dockrest`), on
+    /// whatever window the simulator gives: the chat opened from the Chats list (beside it on a wide window), or with
+    /// R59_REST_FROM=home from Home's Pick-up. Prints the bar, the window, the gap, the readout and every list's frame, then
+    /// holds the screen for the runner's still ("REST731 hold"). R59_REST_SPLIT=1 first asks the system for Vory in half
+    /// the screen through the window's own controls, and puts it back after; with no such control it's a VOID.
+    /// R59_REST_WANT asserts the gap (± 1); without it the case only measures.
+    func testRestPlaceBesideTheList() throws {
+        let fromHome = env["R59_REST_FROM"] == "home"
+        // R59_REST_LANDSCAPE=1: an iPad turned to landscape first, and back after.
+        let landscape = env["R59_REST_LANDSCAPE"] == "1"
+        if landscape { XCUIDevice.shared.orientation = .landscapeLeft }
+        defer { if landscape { XCUIDevice.shared.orientation = .portrait } }
+        try launch(["-vory-dock-rest"], tab: fromHome ? "dashboard" : "chats")
+        var split = false
+        if env["R59_REST_SPLIT"] == "1" {
+            split = halfScreen(true)
+            guard split else { say("VOID SPLIT: no window control for half the screen"); throw XCTSkip("no split") }
+        }
+        defer { if split { say("SPLIT undone \(halfScreen(false)) window \(f(app.windows.firstMatch.frame))") } }
+        try openChat()
+        pause(1.5)
+        let dock = el("chat.dock").frame, win = app.windows.firstMatch.frame, readout = el("debug.dockrest")
+        let gap = win.maxY - dock.maxY
+        say("REST731 from \(fromHome ? "home" : "chats") dock \(f(dock)) window \(f(win)) gap \(String(format: "%.1f", gap))"
+            + " readout \(readout.exists ? readout.label : "none")")
+        for (i, v) in app.collectionViews.allElementsBoundByIndex.enumerated() where v.exists {
+            say("REST731 list \(i) '\(v.identifier)' \(f(v.frame))")
+        }
+        say("REST731 hold")
+        pause(5)
+        if let want = env["R59_REST_WANT"].flatMap(Double.init) { XCTAssertEqual(gap, want, accuracy: 1, "the bar's gap above the window's edge") }
+    }
+
+    /// The window's own controls, through SpringBoard: `half` asks for Vory in the left half of the screen, else for the
+    /// whole screen again. True when the control was found and pressed and the window's width followed. Nothing else on
+    /// the screen is driven: no keys, no coordinates outside the app's window.
+    private func halfScreen(_ half: Bool) -> Bool {
+        let board = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let screen = app.windows.firstMatch.frame.width
+        let controls = board.buttons.matching(NSPredicate(format: "label ==[c] 'Window Controls' OR identifier ==[c] 'window-controls'"))
+        let names = half ? ["Left", "Tile Left", "Arrange Left"] : ["Fill", "Full Screen", "Fill Screen"]
+        say("SPLIT ask \(half ? "half" : "whole"): controls \(controls.count) window \(f(app.windows.firstMatch.frame))")
+        guard let c = controls.allElementsBoundByIndex.first(where: { $0.exists && $0.isHittable }) else { return false }
+        c.press(forDuration: 0.6)
+        pause(1)
+        guard let pick = names.lazy.map({ board.buttons[$0] }).first(where: { $0.exists && $0.isHittable }) else {
+            say("SPLIT no choice among \(names); buttons \(board.buttons.allElementsBoundByIndex.prefix(20).map(\.label))")
+            return false
+        }
+        pick.tap()
+        pause(2)
+        let w = app.windows.firstMatch.frame.width
+        say("SPLIT \(half ? "half" : "whole") done: width \(Int(w)) of \(Int(screen))")
+        return half ? w < screen - 1 : true
     }
 
     // MARK: 2. The pill and the card, 5 times, then after the + panel
