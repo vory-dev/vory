@@ -65,14 +65,22 @@ final class ThreadEndsUITests: XCTestCase {
         wait(1)
     }
 
-    /// Flung to its top, the reopened chat's first row starts at the header's bottom or below it, whole.
+    /// Flung to its top, the reopened chat's first row starts at the header's bottom or below it, whole. A long chat
+    /// shows its newest rows first (65) and the next page up at each reach of its top, so it is flung until the row
+    /// that says older ones are left (`thread.older`) is gone: the chat's own first row is then loaded.
     func testReopenFlungToTopShowsFirstRow() throws {
         guard let (url, token) = env else { throw XCTSkip("HERMES_E2E_URL / HERMES_E2E_TOKEN not set") }
         launch(url: url, token: token)
         try reopenLongChat()
         let thread = app.scrollViews.firstMatch
-        for _ in 0..<12 { thread.swipeDown(velocity: .fast) }
-        wait(1.5)
+        let older = app.descendants(matching: .any).matching(identifier: "thread.older").firstMatch
+        var flings = 0
+        repeat {
+            for _ in 0..<12 { thread.swipeDown(velocity: .fast) }
+            wait(1.5)
+            flings += 12
+        } while older.exists && flings < 480
+        XCTAssertFalse(older.exists, "older rows are still left after \(flings) flings to the top")
         let first = try XCTUnwrap(rows.allElementsBoundByIndex.first(where: { $0.exists }), "no row at the top")
         // No header found would read as a bottom of 0, and a cut row would pass.
         XCTAssertTrue(header.exists, "the chat's header isn't there to read the first row against")

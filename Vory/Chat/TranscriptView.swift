@@ -122,6 +122,12 @@ struct TranscriptView: View {
     /// has set it: it moves only while the thread rests at its end. `TranscriptRowModel.split`
     /// says when it is not used.
     @State private var tailFrom: Int?
+    /// #729's paging (65), under the fix (`ThreadFix`): true while a page is being revealed (`reveal(via:)`), from the
+    /// reveal to two frames after it. It is the spinner row's "Loading" value, and no reveal starts while one is under way.
+    @State private var revealing = false
+    /// How many rows the last reveal drew. The plain top keeps at least these (`ThreadWindow.plainTopEnd`), so a page is
+    /// laid plain as it comes, even past the ceiling.
+    @State private var lastRevealCount = 0
     @State private var overscrollTask: Task<Void, Never>?
     /// When the keyboard last moved: its own spring carries a stuck thread to the end, so a
     /// small overshoot is not landed against it.
@@ -256,6 +262,11 @@ struct TranscriptView: View {
                         }
                         .frame(maxWidth: .infinity).padding(.top, 80)
                     }
+                    // A long chat shown from its newest rows (65): the row that says older ones are left, above them.
+                    // `pageTop` (the first row loaded), `revealing` and `reveal(via:)` are the reveal's own (see there).
+                    if ThreadFix.on, pageTop > 0 {
+                        OlderMessagesRow(loading: revealing) { reveal(via: .action) }
+                    }
                     threadRows
                     // Working with no bubble to fill (between parts, during a tool): the typing
                     // bubble stands on its own, dark with the badge while a tool runs.
@@ -371,6 +382,8 @@ struct TranscriptView: View {
                 anchor.report(offset: new[0], metrics,
                               hidden: (chat.isResuming && chat.items.isEmpty) || landingOutOfSight || historyArriving,
                               items: chat.items.count)
+                // #729's paging: the next page, once the place keeper has this report as its baseline.
+                revealIfNear(offset: new[0], insetTop: new[1])
             }
             // Your own message brings the thread to the end, as in Messages, however far up it
             // was scrolled: a tester sent one from up the thread, saw nothing happen, and had to
@@ -651,6 +664,24 @@ extension TranscriptView {
         let all = rows
         let split = TranscriptRowModel.split(count: all.count, tailFrom: tailFrom)
         let ctx = rowContext
+        if ThreadFix.on {
+            // #729's paging (65): only the rows from `pageTop` on are drawn; `rows` stays the whole thread, so a reveal
+            // changes no count the thread's landing or following reads. The rows drawn above the tail's own are plain up
+            // to the ceiling (`ThreadWindow.plainTopEnd`), each measured as it comes, so nothing above a reader is a lazy
+            // stack's guess (the jumps of #729 and #704). Past the ceiling, the rows nearest the tail are a lazy middle.
+            // They sit below a reader who is up the thread, where a lazy row's guess can't move what is read.
+            let top = pageTop
+            let tail = max(split, top)
+            let mid = ThreadWindow.plainTopEnd(top: top, tail: tail, count: all.count, lastPage: lastRevealCount)
+            if mid > top {
+                ForEach(Array(all[top..<mid])) { row in ctx.rowView(row).environment(\.threadRowInEnd, true) }
+            }
+            if tail > mid {
+                OlderRows(rows: rowCache.middle(mid..<tail), context: ctx.forOlderRows(tail: all[tail...])).equatable()
+            }
+            let entering = Self.enteringRowID(all, opening: settling || chat.isResuming)
+            ForEach(Array(all[tail...])) { row in ctx.rowView(row, entering: row.id == entering).environment(\.threadRowInEnd, true) }
+        } else {
         if split > 0 {
             // The older rows in a view of their own, equal when nothing they draw with has
             // changed: a token landing in the reply at the end used to re-evaluate every row
@@ -661,6 +692,87 @@ extension TranscriptView {
         let entering = Self.enteringRowID(all, opening: settling || chat.isResuming)
         // The rows at the end, marked as never lazy for the row watch (`ThreadRowWatch` reads `threadRowInEnd`).
         ForEach(Array(all[split...])) { row in ctx.rowView(row, entering: row.id == entering).environment(\.threadRowInEnd, true) }
+        }
+    }
+
+    /// #729's paging (65): where the drawn rows start, as an index into `rows`. 0 means every row is drawn (always, without
+    /// the fix). It is the start the chat keeps (`ChatSession.revealFrom`), resolved against the rows as they are now; with
+    /// nothing kept, the newest page (`ThreadPages`). See `ThreadWindow.start` for a kept row that has gone.
+    var pageTop: Int {
+        guard ThreadFix.on else { return 0 }
+        let count = rows.count
+        let newest = ThreadPages.newestPageStart(count: count, turnStarts: rowCache.turnStarts())
+        let kept = chat.revealFrom
+        return ThreadWindow.start(count: count, keptIndex: kept.flatMap { rowCache.index(of: $0.id) },
+                                  keptFromEnd: kept?.fromEnd, newest: newest)
+    }
+
+    /// What asked for a page:
+    /// - `scroll`: the scroll nearing the loaded top (`revealIfNear`). The status bar's tap to the top is one of these,
+    ///   once its animated scroll has come to rest.
+    /// - `action`: the spinner row's accessibility action (`OlderMessagesRow`).
+    /// - `topUp`: the open's top-up, when the newest page is under two screens and the thread is at its end.
+    enum RevealCause: String { case scroll, action, topUp }
+
+    /// #729's paging (65): reveals the page above the drawn rows. The thread's place is kept by the place keeper, which
+    /// answers the held row's move as it answers any row's measured above it (`ThreadAnchor.moved`), told first that a
+    /// page is coming (`expectReveal`), so a page taller than its bound is still answered. At the end, the size-change
+    /// anchor (`.bottom`) keeps the end and the place keeper sees SwiftUI follow (`followed`). Away from it, the anchor is
+    /// `.top` and the place keeper answers. Either way, one writer.
+    func reveal(via cause: RevealCause) {
+        guard ThreadFix.on, !revealing else { return }
+        let top = pageTop
+        guard top > 0 else { return }
+        let all = rows
+        let start = ThreadPages.olderPageStart(from: top, turnStarts: rowCache.turnStarts())
+        guard start < top, all.indices.contains(start) else { return }
+        revealing = true
+        metrics.revealArmed = false
+        lastRevealCount = top - start
+        #if os(iOS)
+        anchor.expectReveal()
+        #endif
+        #if DEBUG
+        if ThreadGeometryWatch.log {
+            Perf.stamp("PAGE reveal via=\(cause.rawValue) from=\(top) to=\(start) rows=\(all.count) stuck=\(metrics.stickToBottom)")
+        }
+        #endif
+        chat.setRevealFrom(all[start].id, fromEnd: all.count - start)
+        Task { @MainActor in
+            await FrameClock.next()
+            await FrameClock.next()
+            revealing = false
+        }
+    }
+
+    /// #729's paging (65): from each offset report, under the fix. Reveals the next page when the loaded top comes within
+    /// two screens of the window's top, as the reader scrolls up, before they reach it. Only when the place keeper can
+    /// answer at once (its `refusal`):
+    /// - not while an animated scroll runs (the status bar's tap to the top; it reveals once it has come to rest);
+    /// - not in the top's own bounce;
+    /// - not before the first finger since the open, unless the thread is at its end, where the anchor keeps the end.
+    /// At its end with fewer than two screens of rows, it tops up (`ThreadPages.needsTopUp`), page by page.
+    func revealIfNear(offset: CGFloat, insetTop: CGFloat) {
+        #if os(iOS)
+        guard ThreadFix.on, !revealing else { return }
+        let top = pageTop
+        guard top > 0 else { return }
+        let fromTop = offset + insetTop
+        let visible = metrics.containerHeight
+        let stuck = metrics.stickToBottom && metrics.distanceFromBottom < 4
+        let phase = anchor.phaseNow
+        // Armed again by the reader's own move up only: a finger, or its glide.
+        if !metrics.revealArmed, !metrics.lastFromTop.isNaN, fromTop < metrics.lastFromTop - 0.5,
+           phase == .tracking || phase == .interacting || phase == .decelerating {
+            metrics.revealArmed = true
+        }
+        metrics.lastFromTop = fromTop
+        let topUp = stuck && ThreadPages.needsTopUp(loadedHeight: Double(metrics.contentHeight), screenHeight: Double(visible), top: top)
+        if topUp { metrics.revealArmed = true }
+        guard metrics.revealArmed, visible > 0, fromTop < 2 * visible, fromTop >= -0.5 else { return }
+        guard phase != .animating, stuck || anchor.touched else { return }
+        reveal(via: topUp ? .topUp : .scroll)
+        #endif
     }
 
     /// The row that fades in if it is new: the last one, once the chat has opened and synced
@@ -836,6 +948,12 @@ extension TranscriptView {
     private func fixOpened() {
         guard ThreadFix.on else { return }
         anchor.opened()
+        // #729's paging: a new open lands at the end with the newest page alone, unless a layout switch is putting the
+        // thread back where it was (`ChatViewMemory`, read before `restoreDistanceFromEnd` clears it). In that case the
+        // rows it was on stay drawn, so the distance it had from the end lands on them.
+        if chat.revealFrom != nil, ChatViewMemory.distanceFromEnd[ChatViewMemory.key(for: chat)] == nil {
+            chat.setRevealFrom(nil, fromEnd: 0)
+        }
         reachTailOpen()
     }
 
@@ -852,6 +970,15 @@ extension TranscriptView {
     /// rows they read would cross under them; the next open, or the backstop at the end, moves it.
     private func crossOffScreen(_ why: String) {
         guard ThreadFix.on else { return }
+        // #729's paging: a thread stuck to its end drops back to the newest page here, out of sight. Rows taken from above
+        // a thread at its end move nothing on screen: the size-change anchor (`.bottom` at the end) keeps the end. No
+        // scroll to the bottom edge goes with it: that is the pairing (an edge scroll in an update that changes the
+        // height) #729's loop came from. If the trim does leave the thread off its end, the next geometry report lands it
+        // the one way every height change is landed (`landPastTheEnd`, then `LandBeforeCommit.now` and `run`). A reader
+        // up the thread keeps the pages they revealed.
+        if metrics.stickToBottom, chat.revealFrom != nil {
+            chat.setRevealFrom(nil, fromEnd: 0)
+        }
         let count = rows.count
         let from = TranscriptRowModel.split(count: count, tailFrom: tailFrom)
         let to = crossTarget()
@@ -1129,6 +1256,12 @@ extension TranscriptView {
     /// so two of them stretch with the load; with none, they are 17 to 33 ms. Only SwiftUI's own report counts, read with
     /// the distance in one reading (the geometry handler): a check against the UIKit scroll view refused every frame where
     /// a separate height handler had missed the last change (69 pt in a Bot Chat), and left the thread to its cap.
+    ///
+    /// The rule (#729): the thread is never shown while its place keeper holds a move (`ThreadAnchor.holdsForLanding`:
+    /// a shift, a fall's settle, a re-set waiting, a fix being set or just set, a fold due), except by the cap. A fall
+    /// in the guesses while the thread is out of sight moves nothing the reader sees, and the place it is shown at is
+    /// its end, set from the bottom; but its settle refuses the fixes of the reader's first touch, so the thread waits
+    /// for it to end. Shown, the place keeper is told (`ThreadAnchor.shown`), and drops what is left of it.
     private func revealIfLanded() {
         guard !metrics.probing else { return }
         if landedAtEnd() {
@@ -1169,6 +1302,14 @@ extension TranscriptView {
                     revealIfLanded()
                     return
                 }
+                #if os(iOS)
+                // The place keeper still holds a move (the rule above): the same quiet frames again, or the cap.
+                if ThreadFix.on, anchor.holdsForLanding != nil {
+                    landingReveal = nil
+                    revealIfLanded()
+                    return
+                }
+                #endif
                 reveal(metrics.landings > 0 ? "landing" : "frames")
             }
         } else {
@@ -1197,9 +1338,17 @@ extension TranscriptView {
             still.disablesAnimations = true
             withTransaction(still) { scrollPosition.scrollTo(edge: .bottom) }
         }
-        #if DEBUG
-        if ThreadGeometryWatch.log { Perf.stamp("SHOWN \(chat.title) by \(why)") }
+        // What the place keeper still held as the thread is shown (only the cap shows it then, #729), then it is told.
+        #if os(iOS)
+        let held: String? = ThreadFix.on ? anchor.holdsForLanding : nil
+        if ThreadFix.on { anchor.shown() }
+        #else
+        let held: String? = nil
         #endif
+        #if DEBUG
+        if ThreadGeometryWatch.log { Perf.stamp("SHOWN \(chat.title) by \(why)" + (held.map { " holds=\($0)" } ?? "")) }
+        #endif
+        _ = held
         metrics.shownItems = chat.items.count
         withAnimation(.easeOut(duration: 0.15)) { landingOutOfSight = false }
     }
@@ -1586,6 +1735,37 @@ private struct OlderRows: View, Equatable {
     }
 }
 
+/// The row at the top of a long chat while older rows are left to show (65), as Messages has there: a small stock
+/// spinner on its own. It shows whenever older rows remain, not only while some are being shown: they come from the
+/// history already here, at once, so a row shown only then would flash. A fixed height, laid plain, so the one shift
+/// that keeps the reader's place when a page lands counts it, and counts it going when the last page is out.
+/// To VoiceOver it is one element, "Earlier messages", "Loading" only while a page is being shown, with an action that
+/// shows the next page: a VoiceOver reader moves by element, so it can't count on scrolling into it.
+private struct OlderMessagesRow: View {
+    static let height: CGFloat = 44
+    var loading: Bool
+    var show: () -> Void
+
+    var body: some View {
+        ProgressView().controlSize(.small)
+            .frame(maxWidth: .infinity, minHeight: Self.height, maxHeight: Self.height)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Earlier messages")
+            .accessibilityValue(loading ? "Loading" : "")
+            .accessibilityHint("Shows earlier messages.")
+            .accessibilityAction { showNext() }
+            .accessibilityAction(named: "Show earlier messages") { showNext() }
+            .accessibilityIdentifier("thread.older")
+    }
+
+    /// The next page, then a word that it's there: the reader stays on this row, which stays at the top, and the page
+    /// lands under it.
+    private func showNext() {
+        show()
+        AccessibilityNotification.Announcement("Earlier messages shown").post()
+    }
+}
+
 /// How a new row comes into a chat thread: a short fade where it belongs, and nothing else. It
 /// carries its own animation, so nothing around it is animated with it. It never slides (a row
 /// moving in from below was drawn over the rows under it) and never fades out (a row fading where
@@ -1918,6 +2098,13 @@ final class ScrollMetrics {
     var stickToBottom = true { didSet { if ThreadFix.on, stickToBottom { lockedNoFinger = true } } }
     /// The lock was set true and no finger has been on the thread since, so `mayFollow` keeps it however far the end is.
     var lockedNoFinger = true
+    /// #729's paging: whether the next reveal may come from the scroll (`revealIfNear`). True at an open. A reveal spends
+    /// it. Only the reader's own move up (a finger, or its glide) arms it again, never the place keeper's set or an
+    /// animated scroll (the status bar's tap to the top), so one approach to the top reveals one page.
+    var revealArmed = true
+    /// #729's paging: the window's distance below the content's top at the last offset report, for the move up that arms
+    /// a reveal. Here, not in view state, as it changes every frame.
+    var lastFromTop: CGFloat = .nan
     var userScrolling = false
     var distanceFromBottom: CGFloat = 0
     /// How far from the end the thread was when the current touch began.
@@ -2176,8 +2363,43 @@ enum ChatStyle {
             built = nextBuilt
             self.key = key
             builds += 1
+            turnStartsBuilt = nil; indexByID = nil; middleRange = nil; middle = []
         }
         return built
+    }
+
+    // #729's paging: these are built from the rows `rows(for:build:)` last returned, once per build:
+    // - the turn starts (the person's own messages), for the page rule (`ThreadPages`);
+    // - each row's index by id, for the start the chat keeps (`ChatSession.revealFrom`).
+    private var turnStartsBuilt: [Int]?
+    private var indexByID: [String: Int]?
+    private var middleRange: Range<Int>?
+    private var middle: [TranscriptRowModel] = []
+
+    /// The indexes of the rows that open a turn (the person's own messages), in order.
+    func turnStarts() -> [Int] {
+        if let t = turnStartsBuilt { return t }
+        let t = built.indices.filter { if case .user = built[$0].item.kind { return true } else { return false } }
+        turnStartsBuilt = t
+        return t
+    }
+
+    /// A row's index by its id, or nil when no row has it.
+    func index(of id: String) -> Int? {
+        if indexByID == nil {
+            indexByID = Dictionary(built.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+        return indexByID?[id]
+    }
+
+    /// The rows in `range` (the lazy middle, `TranscriptView.threadRows`), as the same array while the rows and the range
+    /// hold, as `older(than:)` keeps its own.
+    func middle(_ range: Range<Int>) -> [TranscriptRowModel] {
+        if range != middleRange {
+            middle = Array(built[range])
+            middleRange = range
+        }
+        return middle
     }
 
     /// The rows before `split` of those `rows(for:build:)` last returned, as the same array while they and the split
@@ -3330,9 +3552,32 @@ final class ThreadAnchor {
     private var known: [String: CGRect] = [:]
     private var spans: [String: (above: CGFloat, below: CGFloat)] = [:]
     private var spansDirty = false
-    /// Offset sets of its own since the last fold, so the fold's check doesn't read them as a drop.
+    /// Offset sets at once of its own since the last fold (`moved`), so the fold's check doesn't read them as a drop. A
+    /// write that puts back a move undone from outside is not counted here (#729): it stamps `restoredAt` instead, which
+    /// closes the fold's check.
     private var ownAfterFold: CGFloat = 0
+    /// #729: the last write that put back a move an outside write or the pan had undone, when and which: a SETFIX
+    /// (`setfix`), the re-set (`reset`), the late set (`late`), the fold's re-set (`foldread`). The offset is then where
+    /// it should be, so a late read of a fold or a set made before it (`foldRead`, `lateRead`) stands down instead of
+    /// reading the putting back as a drop (`ownAfterFold` leaves it out).
+    private var restoredAt: UInt64 = 0, restoredBy = "none"
     private var lastReportOwn = false
+    /// UIKit's offset at the last report, for the step of its own since (`readOutside`): a set of the place keeper's own
+    /// is in UIKit's offset at once, where a report in the set's own pass may still carry the offset from before it.
+    private var liveLast: CGFloat = .nan
+    /// #729: the row a shift answers, where it is drawn (its frame's top less the offset and the shift), and how far the
+    /// scroll itself has moved the offset since (the reports' own steps, writes from outside left out). The fold lands
+    /// on it (`foldShift`).
+    private struct ShiftHeld { let id: String; let drawnY: CGFloat; var scrolled: CGFloat }
+    private var shiftHeld: ShiftHeld?
+    /// #729: the writes from outside (neither the scroll's nor the place keeper's) read while a shift is held, which the
+    /// fold puts back.
+    private var outsideW: CGFloat = 0
+    /// #729: a set at once under a finger or in a glide, read once, at the first report 4 ms or more after it (and within
+    /// 40 ms), for a write from outside: the row, where it was drawn, the fix's serial and size, and the scroll's own
+    /// steps since.
+    private struct SetCheck { let id: String; let drawnY: CGFloat; let serial: Int; let e: CGFloat; let at: UInt64; var scrolled: CGFloat }
+    private var setCheck: SetCheck?
     /// The offset's step between the last two reports and between the two before, its own sets left out (`ownSince`);
     /// and the finger's place at the last two reports under a finger.
     private var lastStep: CGFloat = .nan, prevStep: CGFloat = .nan, ownSince: CGFloat = 0
@@ -3382,6 +3627,8 @@ final class ThreadAnchor {
         pending = nil; refixedKeys = []; lateFixedKeys = []
         offMovedUnderFinger = false
         setTo = .nan; fixesThisFrame = 0; fixSerial = [:]
+        liveLast = .nan; shiftHeld = nil; outsideW = 0; setCheck = nil
+        restoredAt = 0; restoredBy = "none"
         #endif
     }
 
@@ -3392,6 +3639,7 @@ final class ThreadAnchor {
         guard shiftSince != 0, let sv = scrollView else { return }
         UIView.performWithoutAnimation { sv.layer.sublayerTransform = CATransform3DIdentity }
         shiftY = 0; shiftSince = 0; shiftSteps = 0
+        shiftHeld = nil; outsideW = 0
         #endif
     }
 
@@ -3401,7 +3649,10 @@ final class ThreadAnchor {
     /// (`pending`), a fix being set (`fixing`), a fold due (`fold`), or a fix set within the last two frames, whose late
     /// read may still come (`fix`). A fall check alone holds nothing: it waits for the next report, which reads the
     /// landing as the offset's move, as it reads the landing a frame later without this.
+    /// A settle past its 500 ms is ended here too (#729): a still thread sends no report to end it, and the thread is not
+    /// shown while it holds (`TranscriptView.revealIfLanded`).
     var holdsForLanding: String? {
+        if settleSince != 0, clock() &- settleSince > 500_000_000 { settleEnd("time") }
         if shiftSince != 0 || shiftY != 0 { return "shift" }
         if settleSince != 0 { return "settle" }
         if pending != nil { return "pending" }
@@ -3409,6 +3660,16 @@ final class ThreadAnchor {
         if foldDue { return "fold" }
         if setAt != 0, clock() &- setAt < 34_000_000 { return "fix" }
         return nil
+    }
+
+    /// The thread is shown at its end (`TranscriptView.reveal(_:)`, #729): a settle or a fall check left from while it was
+    /// out of sight is dropped. The place shown is the end, not the held row, so neither may refuse the fixes of the
+    /// reader's first touch.
+    func shown() {
+        if settleSince != 0 { settleEnd("shown") }
+        if fallCheck != nil {
+            fallCheck = nil
+        }
     }
     #endif
 
@@ -3428,6 +3689,21 @@ final class ThreadAnchor {
 
     /// The content's first height, from inside a reader (`ThreadContentHeight`), to the hundredth of a point.
     func noteContent(_ v: CGFloat) { content = (v * 100).rounded() / 100 }
+
+    #if os(iOS)
+    /// #729's paging: whether a finger has been on the thread since the open. Before one, a fix at rest is refused
+    /// (`refusal`'s "beforetouch"), so a reveal away from the end waits for it (`TranscriptView.revealIfNear`).
+    var touched: Bool { touchedSinceOpen }
+
+    /// #729's paging: when a page was last asked to be added above the reader (`TranscriptView.reveal(via:)`).
+    private var revealAt: UInt64 = 0
+    /// A page is coming above the reader. For the next 250 ms, a held row's move may be larger than the bound (a page is
+    /// many rows) and is still answered. That's room for a slow layout of a page: the SE's read is to keep one under
+    /// 50 ms. Every other refusal stands.
+    func expectReveal() { revealAt = clock() }
+    /// A page was asked for within the last 250 ms.
+    private var revealDue: Bool { revealAt != 0 && clock() &- revealAt < 250_000_000 }
+    #endif
 
     // MARK: The lazy rows
 
@@ -3523,11 +3799,16 @@ final class ThreadAnchor {
         }
         prevStep = lastStep
         lastStep = lastOffset.isNaN ? .nan : offset - lastOffset - ownSince
+        // #729: UIKit's own step since the last report, its own sets left out, for a write from outside (`readOutside`).
+        let live = metrics.scrollView?.contentOffset.y ?? .nan
+        let liveStep = liveLast.isNaN || live.isNaN ? CGFloat.nan : live - liveLast - ownSince
+        liveLast = live
         ownSince = 0
         prevOffset = lastOffset
         prevAt = lastAt
         lastOffset = offset; lastAt = t0
         prevItems = lastItems; lastItems = items
+        readOutside(liveStep, t0, metrics, hidden: out)
         if settleSince != 0, t0 - settleSince > 500_000_000 { settleEnd("time") }
         if fallCheck != nil { resolveFallCheck(offset, t0, via: "report") }
         if foldDue { runDueFold("report") }
@@ -3567,7 +3848,8 @@ final class ThreadAnchor {
                 sv.contentOffset.y = before + p.e
                 fixing = false
                 ownSince += sv.contentOffset.y - before
-                ownAfterFold += sv.contentOffset.y - before
+                // #729: a putting back, kept out of `ownAfterFold`; the stamp closes `foldRead` and `lateRead`.
+                restoredAt = clock(); restoredBy = "reset"
                 refixedKeys.insert("\(p.id)#\(p.serial)")
             }
         }
@@ -3580,16 +3862,97 @@ final class ThreadAnchor {
         settleSince = 0; settleNeed = 0; settleGot = 0
     }
 
+    /// A write to the offset from outside (#729): neither the scroll's own step nor the place keeper's own sets. SwiftUI's
+    /// scroll view writes the offset in its own update (`updateContext`), and has done so right after a shift and right
+    /// after a set, from its own reading of a layout the place keeper had already answered, so the two added up. It is
+    /// UIKit's step since the last report, its own sets left out (`liveStep`), less the scroll's own step: the finger's
+    /// move under a finger, the glide's step in a glide, none at rest. Read only while a shift is held, and once after a
+    /// set at once under a finger or in a glide; over the slop (10 pt or a tenth of what was answered) and within the bound:
+    /// - **a shift held:** the write is kept (`outsideW`) and the shift is folded at once, the fold putting it back;
+    /// - **after a set:** the offset is set to the held row's place (where it was drawn at the set, moved by the scroll
+    ///   since), only when that agrees within the slop with the offset less the write, the two readings of one place; else
+    ///   nothing is set, as before. The set's own late read and re-set are then dropped.
+    private func readOutside(_ liveStep: CGFloat, _ t0: UInt64, _ m: ScrollMetrics, hidden out: Bool) {
+        guard let sv = m.scrollView else { return }
+        // The set's check waits for the first report 4 ms or more after it: one in the set's own pass is not yet the next.
+        if var c = setCheck, t0 &- c.at < 4_000_000 {
+            if !liveStep.isNaN { c.scrolled += liveStep }
+            setCheck = c
+            if shiftSince == 0 { return }
+        }
+        let fingerPhase = phaseNow == .tracking || phaseNow == .interacting
+        // The scroll's own step since the last report; nil when it can't be told (the finger's first report, a glide's
+        // first, an animated scroll).
+        var scrollStep: CGFloat?
+        if fingerPhase {
+            if let f0 = fingerLast { scrollStep = -(sv.panGestureRecognizer.location(in: sv.superview).y - f0) }
+        } else if phaseNow == .decelerating {
+            if !prevStep.isNaN { scrollStep = glideStep().0 }
+        } else if phaseNow == .idle {
+            scrollStep = 0
+        }
+        let ins = sv.adjustedContentInset
+        let bound = Self.bound * (sv.bounds.height - ins.top - ins.bottom)
+        let quiet = m.probing || out
+        let w = scrollStep.map { liveStep - $0 } ?? .nan
+        if shiftSince != 0, var h = shiftHeld {
+            if let step = scrollStep, !w.isNaN, !quiet, abs(w) > max(10, 0.1 * abs(shiftY)), abs(w) <= bound {
+                h.scrolled += step
+                shiftHeld = h
+                outsideW += w
+                foldShift("outside")
+            } else {
+                if !liveStep.isNaN { h.scrolled += liveStep }
+                shiftHeld = h
+            }
+        }
+        guard let c = setCheck, t0 &- c.at >= 4_000_000 else { return }
+        setCheck = nil
+        guard t0 &- c.at <= 40_000_000, let step = scrollStep, !w.isNaN, fingerPhase || phaseNow == .decelerating, !quiet,
+              !(m.stickToBottom && m.distanceFromBottom < 4), abs(w) > max(10, 0.1 * abs(c.e)), abs(w) <= bound else { return }
+        let live = sv.contentOffset.y
+        let rel = live - w
+        let row = known[c.id].map { $0.minY - c.drawnY + c.scrolled + step }
+        let agree = row.map { abs($0 - rel) }
+        var target = (agree.map { $0 <= max(10, 0.1 * abs(w)) } ?? false) ? row : nil
+        // Not past an edge, and not when anything else has acted on the row or the offset since the set.
+        let height = max(sv.contentSize.height, content)
+        let top = -ins.top, bottom = height + ins.bottom - sv.bounds.height
+        if let t = target, t < top - 0.5 || t > bottom + 0.5 { target = nil }
+        if fixSerial[c.id, default: 0] != c.serial || shiftSince != 0 || settleSince != 0 || fallCheck != nil { target = nil }
+        guard let t = target else {
+            return
+        }
+        fixing = true
+        sv.contentOffset.y = t
+        fixing = false
+        ownSince += sv.contentOffset.y - live
+        // #729: a putting back, kept out of `ownAfterFold`; the stamp closes `foldRead` and `lateRead`.
+        restoredAt = clock(); restoredBy = "setfix"
+        setTo = sv.contentOffset.y; setAt = t0
+        // The set's own re-set and late read would put back the offset this replaces.
+        refixedKeys.insert("\(c.id)#\(c.serial)")
+        if pending?.id == c.id { pending = nil }
+    }
+
     /// A held-row move answered in what is drawn. The scroll view's layer draws its content `e` higher
     /// (`sublayerTransform`, render only; no view or SwiftUI geometry changes), set plainly, so it joins the turn's own
     /// transaction and is committed with the layout move it answers. The view's own layer takes no implicit animation
     /// outside an animation block, and `performWithoutAnimation` keeps any block out.
-    private func applyShift(_ sv: UIScrollView, _ e: CGFloat) {
+    /// The held row and its frame's top in the content (`rowY`) are kept with where the shift draws it (#729, `ShiftHeld`).
+    private func applyShift(_ sv: UIScrollView, _ e: CGFloat, id: String, rowY: CGFloat) {
         if shiftSince == 0 { shiftSince = clock() }
         shiftY += e; shiftSteps += 1
         UIView.performWithoutAnimation {
             sv.layer.sublayerTransform = CATransform3DMakeTranslation(0, -shiftY, 0)
         }
+        shiftHeld = ShiftHeld(id: id, drawnY: rowY - (sv.contentOffset.y + shiftY), scrolled: scrolledBefore(sv.contentOffset.y))
+    }
+
+    /// The scroll's move since the last report up to an offset set or drawn now, taken off what the next report counts
+    /// (`readOutside` counts UIKit's whole step since the last report): the start of a held row's count (#729).
+    private func scrolledBefore(_ off: CGFloat) -> CGFloat {
+        liveLast.isNaN ? 0 : -(off - liveLast - ownSince)
     }
 
     /// The fold a lazy row's laying asked for, run here, outside SwiftUI's layout: from the next offset report or the
@@ -3603,31 +3966,46 @@ final class ThreadAnchor {
 
     /// The drawing's shift folded into UIKit's offset, both in the turn's own transaction: the transform cleared and the
     /// offset moved by the shift, so what is drawn does not move.
+    ///
+    /// #729: the fold lands on the held row (`ShiftHeld`): its frame's top now, less where the shift drew it, moved by
+    /// the scroll since. That is checked against the offset moved by the shift less any write from outside since
+    /// (`outsideW`), the other reading of the same place. Agreed within the slop (10 pt or a tenth of the shift), the
+    /// row's place is set; otherwise, or with the row gone, the offset is moved by the shift, as before. A write from
+    /// outside after the shift (SwiftUI's own, from its reading of the same layout) is then undone in the fold rather
+    /// than kept under it.
     private func foldShift(_ why: String, via: String = "at") {
         // Any fold clears a fold still due: what it would fold is folded now.
         foldDue = false
         guard shiftSince != 0 else { return }
         let s = shiftY
         shiftY = 0; shiftSince = 0; shiftSteps = 0
+        let held = shiftHeld, w = outsideW
+        shiftHeld = nil; outsideW = 0
         guard let sv = scrollView else {
             return
         }
         let before = sv.contentOffset.y
+        // The scroll's move since the last report, which the held row's place has not counted yet.
+        let since = liveLast.isNaN ? 0 : before - liveLast - ownSince
+        let row = held.flatMap { h in known[h.id].map { $0.minY - h.drawnY + h.scrolled + since } }
+        let agree = row.map { abs($0 - (before + s - w)) }
+        let onRow = agree.map { $0 <= max(10, 0.1 * abs(s)) } ?? false
+        let to = onRow ? (row ?? before + s) : before + s
         UIView.performWithoutAnimation {
             sv.layer.sublayerTransform = CATransform3DIdentity
             fixing = true
-            sv.contentOffset.y = before + s
+            sv.contentOffset.y = to
             fixing = false
         }
         ownSince += sv.contentOffset.y - before
         ownAfterFold = 0
         foldAt = clock(); folds += 1
-        // One frame later: did UIKit keep the fold's offset? (A pan can drop a set.)
+        // One frame later: did UIKit keep the fold's offset? (A pan can drop a set.) What it moved is what is checked.
         let target = sv.contentOffset.y, fingerAt = sv.panGestureRecognizer.location(in: sv.superview).y
-        let serial = folds, at = foldAt
+        let serial = folds, at = foldAt, setBy = target - before
         Task { @MainActor [weak self] in
             await FrameClock.next()
-            self?.foldRead(sv, s: s, target: target, fingerAt: fingerAt, serial: serial, at: at)
+            self?.foldRead(sv, s: setBy, target: target, fingerAt: fingerAt, serial: serial, at: at)
         }
     }
 
@@ -3652,7 +4030,10 @@ final class ThreadAnchor {
         let ins = sv.adjustedContentInset
         let bound: CGFloat = Self.bound * (sv.bounds.height - ins.top - ins.bottom)
         let why: String?
-        if !fingerPhase { why = phaseNow == .decelerating ? "glide" : "nofinger" }
+        // #729: a putting back since the fold (`restoredAt`) is in the live offset but not in `ownAfterFold`: the offset
+        // is back already, and what reads as dropped is that putting back.
+        if restoredAt > at { why = "restored" }
+        else if !fingerPhase { why = phaseNow == .decelerating ? "glide" : "nofinger" }
         else if folds != serial { why = "foldedagain" }
         else if shiftSince != 0 { why = "shifting" }
         else if settleSince != 0 || fallCheck != nil { why = "settling" }
@@ -3670,6 +4051,8 @@ final class ThreadAnchor {
         sv.contentOffset.y = live + s
         fixing = false
         ownSince += sv.contentOffset.y - live
+        // #729: a putting back; the stamp closes `lateRead` of a set made before it, whose `want` may lack the fold.
+        restoredAt = clock(); restoredBy = "foldread"
     }
 
     /// A big move up, held for a check: the offset now (from the next report, or UIKit's live offset when no report came
@@ -3744,7 +4127,8 @@ final class ThreadAnchor {
             edgeCase = "moved"
         }
         let bound: CGFloat = Self.bound * visible
-        if abs(e) > bound { return "big" }
+        // #729's paging: a page the thread asked for (`expectReveal`) may be taller than the bound and is answered.
+        if abs(e) > bound, !revealDue { return "big" }
         if fixesThisFrame >= 8 { return "runaway" }
         return nil
     }
@@ -3856,8 +4240,21 @@ final class ThreadAnchor {
             pending = nil
             return
         }
-        if refusal(sv, at: now, e: e, visible: visible) != nil { return }
+        // #729's paging: each answer the place keeper gives while a page is due (`expectReveal`'s 250 ms, in which the
+        // "big" refusal is lifted) is logged with its size beside the PAGE line, so the probe build reads one answer per
+        // page and its size against the page's height (DEBUG, under -vory-geometry-log).
+        #if DEBUG
+        let pageLog: (String) -> Void = { what in
+            if self.revealDue, ThreadGeometryWatch.log {
+                Perf.stamp(String(format: "PAGE answer %@ e=%.1f dy=%.1f c=%.1f held=%@ phase=%@", what, e, dy, cPart, id, String(describing: self.phaseNow)))
+            }
+        }
+        #else
+        let pageLog: (String) -> Void = { _ in }
+        #endif
+        if let why = refusal(sv, at: now, e: e, visible: visible) { pageLog("refused-\(why)"); return }
         if followed {
+            pageLog("followed")
             return
         }
         guard abs(e) >= 0.5 else { return }
@@ -3867,11 +4264,13 @@ final class ThreadAnchor {
         // inside.
         if lazyLive.isEmpty, phaseNow != .idle, edgeCase != "moved" {
             if abs(shiftY + e) <= Self.bound * visible {
-                applyShift(sv, e)
+                applyShift(sv, e, id: id, rowY: new.minY)
+                pageLog("shift")
                 return
             }
             foldShift("bound")
         }
+        pageLog("set")
         fixing = true
         sv.contentOffset.y = now + e
         fixing = false
@@ -3884,6 +4283,12 @@ final class ThreadAnchor {
                               serial: fixSerial[id, default: 0], pan: pan, at: t0)
         }
         lateRead(id, sv, want: setTo, serial: fixSerial[id, default: 0], finger: sv.panGestureRecognizer.location(in: sv.superview).y, at: t0)
+        // #729: under a finger or in a glide, neither the late read nor the re-set answers a write from outside (they
+        // refuse a moved finger and a glide, and the re-set only a fix the pan dropped whole), so the next report reads
+        // for one (`readOutside`).
+        if underFinger || phaseNow == .decelerating {
+            setCheck = SetCheck(id: id, drawnY: new.minY - setTo - shiftY, serial: fixSerial[id, default: 0], e: setTo - now, at: t0, scrolled: scrolledBefore(setTo))
+        }
         #endif
     }
 
@@ -3902,6 +4307,9 @@ final class ThreadAnchor {
             let bound: CGFloat = Self.bound * (sv.bounds.height - ins.top - ins.bottom)
             let why: String?
             if self.refixedKeys.contains("\(id)#\(serial)") { why = "refixed" }
+            // #729: a putting back since the set (`restoredAt`) moved the offset off `want` on purpose; `want` may lack
+            // what it put back (a fold undone before the set).
+            else if self.restoredAt > at { why = "restored" }
             else if self.settleSince != 0 || (self.fallAt != 0 && at < self.fallAt) { why = "fall" }
             else if self.foldAt != 0 && at < self.foldAt { why = "fold" }
             else if self.phaseNow == .decelerating { why = "glide" }
@@ -3919,7 +4327,8 @@ final class ThreadAnchor {
             self.fixing = true
             sv.contentOffset.y = want
             self.ownSince += sv.contentOffset.y - off
-            self.ownAfterFold += sv.contentOffset.y - off
+            // #729: a putting back, kept out of `ownAfterFold`; the stamp closes `foldRead` and other late reads.
+            self.restoredAt = self.clock(); self.restoredBy = "late"
             self.fixing = false
             self.lateFixedKeys.insert("\(id)#\(serial)")
         }
