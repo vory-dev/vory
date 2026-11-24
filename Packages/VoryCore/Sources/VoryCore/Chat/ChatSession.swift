@@ -315,6 +315,27 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             yield &_isResuming
         }
     }
+    /// Where the chat's thread starts drawing its rows (#729's paging, `ThreadWindow`). It's kept here so that it outlives
+    /// the thread view (a layout switch rebuilds it) and every snapshot (a re-attach, a background return, a reconnect
+    /// replaces `items`). nil means the newest page. The thread sets it as it reveals an older page
+    /// (`TranscriptView.reveal(via:)`) and clears it when it drops back to the newest page: a new open at the end, or the
+    /// thread going off screen at its end. Nothing here acts on it.
+    @ObservationIgnored private var _revealFrom: RevealFrom?
+    public private(set) var revealFrom: RevealFrom? {
+        get { access(keyPath: \.revealFrom); return _revealFrom }
+        set { setTracked(\.revealFrom, \._revealFrom, newValue) }
+        _modify {
+            access(keyPath: \.revealFrom)
+            let told = willModify(\.revealFrom)
+            defer { didModify(\.revealFrom, told) }
+            yield &_revealFrom
+        }
+    }
+    /// Sets where the thread starts drawing (`revealFrom`): the first drawn row's id, and how many rows from the end it is
+    /// now. nil goes back to the newest page.
+    public func setRevealFrom(_ id: String?, fromEnd: Int) {
+        revealFrom = id.map { RevealFrom(id: $0, fromEnd: max(0, fromEnd)) }
+    }
     /// "Syncing…" is for a chat with nothing to show yet; with the cached transcript on screen
     /// the attach runs silently behind the title (2026-10-12: "a Syncing… status, speed
     /// that up").
