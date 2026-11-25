@@ -1102,9 +1102,27 @@ struct MorphTopBar: View {
                 trailButtons([(model.filesShowHidden ? "eye" : "eye.slash", model.filesShowHidden ? "Hide hidden files" : "Show hidden files", "files.hidden", { model.pageRequest = .init(.filesToggleHidden) }),
                               ("square.and.arrow.up", "Upload", "files.upload", { model.pageRequest = .init(.filesUpload) })])
             case .boardActions:
-                // The board's … menu needs its store (nudge, refresh): the page's own until wired.
-                trailButtons([("ellipsis.circle", "Board options", "board.options", {}),
-                              ("plus", "Add task", "board.new", { model.pageRequest = .init(.boardNew) })])
+                // #755: the board's options menu at the Board tab's root, wired as its Add is: each item asks the page
+                // (`pageRequest`), which answers with its store (KanbanView). It was an empty button here, with the working
+                // menu in the page's own toolbar, hidden under this bar.
+                // The same row as `trailButtons` draws (its footprint is what `trailIcons` measures), with the menu first.
+                HStack(spacing: BarIcon.spacing) {
+                    Menu {
+                        Button { model.pageRequest = .init(.boardNudge) } label: { Label("Nudge Dispatcher", systemImage: "hare") }
+                        Button { model.pageRequest = .init(.boardRefresh) } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                    } label: { Image(systemName: "ellipsis.circle").contentShape(.rect) }
+                    .menuStyle(.button).buttonStyle(MorphPressStyle(kind: .icon)).barIconHitArea()
+                    .accessibilityLabel("Board options").accessibilityIdentifier("board.options")
+                    .accessibilityShowsLargeContentViewer { Label("Board options", systemImage: "ellipsis.circle") }
+                    Button { model.pageRequest = .init(.boardNew) } label: { Image(systemName: "plus").contentShape(.rect) }
+                        .buttonStyle(MorphPressStyle(kind: .icon)).barIconHitArea()
+                        .accessibilityElement(children: .ignore).accessibilityLabel("Add task").accessibilityAddTraits(.isButton)
+                        .accessibilityAction { model.pageRequest = .init(.boardNew) }
+                        .accessibilityShowsLargeContentViewer { Label("Add task", systemImage: "plus") }
+                        .accessibilityIdentifier("board.new")
+                }
+                .font(.body.weight(.medium)).foregroundStyle(.tint)
+                .padding(.horizontal, BarIcon.endPadding).frame(height: 44)
             case .sessionsOptions:
                 Menu {
                     Button { model.pageRequest = .init(.sessionsAdvanced) } label: { Label("Advanced", systemImage: "internaldrive") }
