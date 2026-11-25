@@ -58,8 +58,14 @@ struct KanbanView: View {
         .task(id: active) { await follow() }
         .reloadable { await store?.refresh() }
         .onChange(of: model.pageRequest) { _, r in
-            guard barDrawsNew, let r, r.kind == .boardNew else { return }
-            model.pageRequest = nil; showNew = true
+            guard barDrawsNew, let r else { return }
+            switch r.kind {
+            case .boardNew: model.pageRequest = nil; showNew = true
+            // #755: the bar's Board options at the Board tab's root, answered with the board's store as its own menu does.
+            case .boardNudge: model.pageRequest = nil; Task { await store?.nudge() }
+            case .boardRefresh: model.pageRequest = nil; Task { await store?.refresh() }
+            default: break
+            }
         }
         .morphPageActions([
             MorphPageAction(id: "board.options", symbol: "ellipsis.circle", label: "Board options", menu: [

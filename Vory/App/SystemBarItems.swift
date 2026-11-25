@@ -465,7 +465,15 @@ struct StripMarkerReader: UIViewControllerRepresentable {
         private func item(_ kind: StripMarkers.Kind) -> UIBarButtonItem { kind == .back ? backItem : moreItem }
 
         private static func item(_ title: String, _ symbol: String) -> UIBarButtonItem {
-            let item = UIBarButtonItem(title: title, image: UIImage(systemName: symbol))
+            // Clear by construction, not only by tint: the image drawn in clear as its own colors, and the title's text
+            // clear in every state. During a push or a pop UIKit builds its own copies of the bar's items for the
+            // transition, which ride the page; they drew the glyph for a frame before the views were hidden
+            // (`hideViews`). The same symbol and title keep the item's size, so its place is read as before.
+            let image = UIImage(systemName: symbol)?.withTintColor(.clear, renderingMode: .alwaysOriginal)
+            let item = UIBarButtonItem(title: title, image: image)
+            for state: UIControl.State in [.normal, .highlighted, .disabled, .selected, .focused] {
+                item.setTitleTextAttributes([.foregroundColor: UIColor.clear], for: state)
+            }
             item.tintColor = .clear
             item.hidesSharedBackground = true
             item.isAccessibilityElement = false

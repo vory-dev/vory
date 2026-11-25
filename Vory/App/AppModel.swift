@@ -264,7 +264,7 @@ final class AppModel {
     /// The other root pages' bar actions, asked for by the morph prototype's bar; each page
     /// answers its own.
     struct PageRequest: Equatable {
-        enum Kind { case botsNewBot, filesHome, filesToggleHidden, filesUpload, projectsNew, boardNew, sessionsAdvanced, cronNew }
+        enum Kind { case botsNewBot, filesHome, filesToggleHidden, filesUpload, projectsNew, boardNew, boardNudge, boardRefresh, sessionsAdvanced, cronNew }
         let id = UUID(); let kind: Kind; init(_ kind: Kind) { self.kind = kind }
     }
     var pageRequest: PageRequest?

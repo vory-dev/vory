@@ -288,12 +288,24 @@ struct LockScreenView: View {
 struct MainTabView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.windowGeometry) private var windowGeometry
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.layoutDirection) private var layoutDirection
     @AppStorage(TabLayout.storageKey) private var layoutRaw = ""
 
     var body: some View {
         let tabs = TabLayout.parse(layoutRaw).visible(hiding: model.hiddenTabs)
         let barHeight = VoryTabBar.reservedHeight(in: windowGeometry)
-        let hiddenFraction: CGFloat = model.tabBarHidden ? max(0, 1 - model.popProgress) : 0
+        // On the closed strip, a chat's push and pop on Chats cover the capsule instead of timing it out: the chat's page
+        // passes over it as the system's own tab bar is covered by a pushed page (`RidesUnderChat`), drawn from the place
+        // the top bar already follows every frame (`MorphState.followed`, else its timed `t`). Before this change the capsule
+        // slid toward the edge and faded on its own 0.3 s, over the chat sliding in under it: a ghost, then a cut. Reduce Motion
+        // keeps the fade (no slide), as there is no slide to follow there. Right to left (a page coming from the left) keeps
+        // the old hide too. Everywhere else, as before.
+        let morph = MorphState.shared
+        let closedStrip = TopBarRoom.closedStrip(barsVertical: model.tabBarVertical, size: windowGeometry.bounds.size)
+        let rides = closedStrip && layoutDirection == .leftToRight && MorphTopBar.active(model) && model.selectedTab == .chats
+            && (model.chatsPathOpen || morph.away)
+        let hiddenFraction: CGFloat = model.tabBarHidden && !(rides && !reduceMotion) ? max(0, 1 - model.popProgress) : 0
         // Where the system would put a vertical bar (the closed Duo's strip, the open Duo in
         // landscape), Vory's own bar goes there too, stacked on that edge (decision 1): the
         // pages are inset by its width instead of its height. Nil: along the bottom, as ever.
@@ -332,7 +344,7 @@ struct MainTabView: View {
                 // Hidden for an open chat, the bar comes back by the back swipe's progress (the
                 // finger scrubs it, a cancelled swipe sends it out again); the button Back and
                 // the push keep the snappy slide below.
-                .offset(x: vertical ? (edge == .leading ? -140 : 140) * hiddenFraction : 0,
+                .offset(x: vertical && !(rides && reduceMotion) ? (edge == .leading ? -140 : 140) * hiddenFraction : 0,
                         y: !vertical ? 140 * hiddenFraction : 0)
                 .opacity(1 - hiddenFraction)
                 // The slide and fade animate; the reserved size below does not. Animating the
@@ -341,6 +353,10 @@ struct MainTabView: View {
                 // path alone it snapped back half a second early and re-laid out the chat while
                 // it slid away.
                 .animation(.snappy(duration: 0.3), value: model.tabBarHidden)
+                // Covered by a chat sliding over it, on the closed strip (`rides` above). Outside the fade's animation: the
+                // edge is the page's own place each frame, or the morph's timed `t`, which animates itself. The page's place
+                // is read inside the modifier, so only the capsule's mask redraws each frame, never this whole view.
+                .modifier(RidesUnderChat(on: rides && !reduceMotion, width: windowGeometry.bounds.width))
                 // Anchored to the window's edge: with no room reserved the bar stands over
                 // the page (as the system's does over a chat sliding away), not below the screen.
                 .frame(width: vertical ? (model.tabBarReserved ? VoryTabBar.reservedWidth : 0) : nil,
@@ -460,6 +476,44 @@ struct MainTabView: View {
         case .dashboard: NavigationStack { DashboardView().tabRoot(.dashboard) }
         case .projects: NavigationStack { ProjectsView().tabRoot(.projects) }
         case .status: NavigationStack { StatusView().tabRoot(.status) }
+        }
+    }
+}
+
+/// The closed strip's capsule under a chat's page as it slides (`MainTabView`'s `rides`): drawn only to the leading side of
+/// the page's leading edge, so the page covers it as it comes and uncovers it as it goes, with the finger on a swipe back.
+/// Nothing moves and nothing fades: the page passes over a bar that stands still, as the system's tab bar is covered by a
+/// pushed page. The edge is the page's place as the top bar draws it (`MorphBarHost`: `followed` while a push or pop is
+/// followed, else the morph's `t`), read here so its every-frame changes redraw this modifier only.
+private struct RidesUnderChat: ViewModifier {
+    var on: Bool
+    var width: CGFloat
+    func body(content: Content) -> some View {
+        let s = MorphState.shared
+        let p: CGFloat = s.away ? (s.followed ?? s.t) : 1
+        content.modifier(EdgeMask(edge: on ? p * width : .greatestFiniteMagnitude))
+    }
+}
+
+/// The mask itself: what stands to the leading side of `edge` (window space). A huge edge draws the whole capsule.
+private struct EdgeMask: ViewModifier, Animatable {
+    var edge: CGFloat
+    var animatableData: CGFloat {
+        get { edge }
+        set { edge = newValue }
+    }
+    func body(content: Content) -> some View {
+        content.mask(alignment: .topLeading) {
+            GeometryReader { g in
+                let f = g.frame(in: .global)
+                let shown = max(0, min(g.size.width, edge - f.minX))
+                #if DEBUG
+                // The frame log (`-vory-morph-log`): the capsule's drawn part and the page's edge, while the edge is real,
+                // "<wall time> ride <minX> <edge> <shown width> <capsule width>" (StripRide66UITests reads it).
+                let _ = edge < 1e6 ? MorphFramesProbe.note("ride", CGRect(x: f.minX, y: edge, width: shown, height: f.width)) : ()
+                #endif
+                Rectangle().frame(width: shown, height: g.size.height)
+            }
         }
     }
 }
