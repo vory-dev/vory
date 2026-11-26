@@ -104,13 +104,16 @@ struct StatusView: View {
     private func isFailed(_ s: SocketState) -> Bool {
         if case .failed = s { return true }
         if case .authRejected = s { return true }
-        if case .unreachable = s { return true }
+        // A restart reads as reconnecting, as the pill shows it: the gateway is coming back.
+        if case .unreachable(let problem, _) = s { return problem != .restarting }
         return false
     }
     private func gatewayDetail(_ s: SocketState, _ rt: GatewayRuntime) -> String {
         switch s {
         case .connecting: return "Connecting to \(rt.connection.name)…"
         case .reconnecting(let n, _): return "Lost the connection; trying again (attempt \(n))"
+        // A restart says what it is as well as what comes next, as the Chats menu does.
+        case .unreachable(.restarting, _): return "\(ConnectProblem.restarting.title). \(ConnectProblem.restarting.detail)"
         case .unreachable(let problem, _): return problem.detail
         case .failed(let why): return "Cannot reach \(rt.connection.name): \(why)"
         case .authRejected: return "\(rt.connection.name) refused the sign-in"
@@ -123,7 +126,10 @@ struct StatusView: View {
         return s.isOpen ? .good : .warn
     }
     private func signInDetail(_ s: SocketState, _ rt: GatewayRuntime) -> String {
-        if case .authRejected(let why) = s { return why.isEmpty ? "The gateway rejected the session. Sign in again." : why }
+        if case .authRejected(let why) = s {
+            return ConnectProblem.refusedWords(why: why.isEmpty ? "The gateway rejected the session. Sign in again." : why,
+                                               authMode: rt.connection.authMode, refreshRefused: rt.refreshRefused)
+        }
         switch rt.connection.authMode {
         case .sessionToken: return "Using the gateway's session token"
         case .password: return "Signed in with a username and password"
@@ -139,15 +145,7 @@ struct StatusView: View {
         if setup.companionHealthy { return .good }
         return .warn
     }
-    private var companionDetail: String {
-        if let e = setup.companionCheckError { return "Could not check: \(e)" }
-        guard let v = setup.installedVersion else { return "Not installed. Settings › Companion installs it in one \(DeviceWords.tap)." }
-        if setup.companionHealthy { return "Running, version \(v)" }
-        if setup.needsRestart { return "Installed (\(v)) but the gateway has not restarted with it yet" }
-        if setup.heartbeat == nil { return "Installed (\(v)) but it has not reported in. Restart the gateway." }
-        if setup.runningOlderCode || !setup.installedScriptMatches { return "Running an older version than this build ships. Update it from Settings › Companion." }
-        return "Installed (\(v)) but its last report is old. Is the gateway running?"
-    }
+    private var companionDetail: String { CompanionStatusLine.of(setup) }
     private var approvalsLight: Light {
         guard let rt = model.runtime else { return .off }
         if rt.serverRequestsAdvertised.isEmpty { return .warn }
@@ -188,5 +186,19 @@ struct StatusView: View {
         if !LiveActivityController.isEnabled { return "Turned off in Settings › Notifications" }
         if !activitiesAllowed { return "Not allowed for Vory in Settings" }
         return push.pushToStartToken == nil ? "On. The gateway can update a running one; starting one while Vory is closed is not set up yet on \(DeviceWords.this)" : "On, and the gateway can start one while Vory is closed"
+    }
+}
+
+/// The Companion row's detail on Status: the first line that holds, read from the setup model.
+@MainActor enum CompanionStatusLine {
+    static func of(_ setup: PushSetupModel) -> String {
+        if let e = setup.companionCheckError { return "Could not check: \(e)" }
+        guard let v = setup.installedVersion else { return "Not installed. Settings › Companion installs it in one \(DeviceWords.tap)." }
+        if setup.companionHealthy { return "Running, version \(v)" }
+        // An older script on the gateway's disk is updated first: a restart would only start the old code again.
+        if !setup.installedScriptMatches { return "Running an older version than this build ships. Update it from Settings › Companion." }
+        if setup.needsRestart { return "Installed (\(v)) but the gateway has not restarted with it yet. If this stays, restart the gateway." }
+        if setup.heartbeat == nil { return "Installed (\(v)) but it has not reported in. Restart the gateway." }
+        return "Installed (\(v)) but its last report is old. Is the gateway running?"
     }
 }

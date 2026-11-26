@@ -1058,7 +1058,8 @@ PROFILE_RENAMES: list[dict] = []
 # The gateway reports an older companion (its plugin.yaml, an older hermes_push.py and a connected heartbeat). The
 # app's upload is kept in memory and read back, so the bundled script's hash matches after it; the heartbeat reports
 # the uploaded version 3 s after the last file lands (the companion reloading itself in place) or, with
-# --companion-restart, only once a gateway restart asked after the upload has run 4 s.
+# --companion-restart, only once a gateway restart asked after the upload has run 4 s. With MOCK_COMPANION_ERROR=<words>,
+# the heartbeat says the companion is up but not connected, with those words as its error (its own status file's shape).
 COMPANION: dict = {"version": None, "restart": False, "files": {}, "uploaded_at": None}
 COMPANION_OLD_SCRIPT = b"# vory-push companion: an older build, as the mock serves it\n"
 COMPANION_FILES = ("/plugins/vory-push/plugin.yaml", "/plugins/vory-push/hermes_push.py", "/plugins/vory-push/__init__.py",
@@ -1083,8 +1084,12 @@ def companion_heartbeat() -> dict:
         version, script = (m.group(1).decode() if m else "?"), files["/plugins/vory-push/hermes_push.py"]
     else:
         version, script = COMPANION["version"], COMPANION_OLD_SCRIPT
-    return {"version": version, "script_sha256": hashlib.sha256(script).hexdigest(), "profile": "default",
-            "updated_at": time.time(), "connected": True, "transport": "websocket", "attached": 1, "devices": 1}
+    down = os.environ.get("MOCK_COMPANION_ERROR", "")
+    beat = {"version": version, "script_sha256": hashlib.sha256(script).hexdigest(), "profile": "default",
+            "updated_at": time.time(), "connected": not down, "transport": "websocket", "attached": 1, "devices": 1}
+    if down:
+        beat["error"] = down
+    return beat
 
 
 def companion_read(p: str) -> tuple[int, object]:
@@ -1600,8 +1605,61 @@ REFUSE_PINS = NO_PINS or "--refuse-pins" in sys.argv
 # execution_generation, revision} (gateway/session_authority.py _publish_pending); its end publishes it again.
 # session.create and session.resume answer `revision` and a new `subscription_id`. GET /api/_mock/authority reads back
 # every mutate, detach and steer.
-AUTHORITY = "--authority" in sys.argv
+AUTHORITY = "--authority" in sys.argv or "--migrated" in sys.argv
 STRICT_PARAMS = "--strict-params" in sys.argv or AUTHORITY
+# --migrated: a gateway after Hermes v0.23.4's `hermes gateway migrate --backends --apply` (NousResearch/hermes-agent at
+# v0.23.4, 8fc03744, read as text). It implies --authority: the migrated listener's /api/ws is always the gateway's
+# session authority (gateway/run_api.py _bind_state; hermes_cli/web_routers/chat_ws.py gateway_ws). v0.23.4's rules on top:
+#   the session token  the Webapp's own (MIGRATED_TOKEN, printed at the start; --migrated-token sets it), not --token's.
+#                      With no sign-in gate (no --password-auth), an /api/ call whose X-Hermes-Session-Token (or Bearer)
+#                      isn't it answers 401 {"detail": "Unauthorized"}, and /api/ws?token= of any other closes 4401
+#                      (run_api.py _bind_state; gateway/webapp_listener.py browser_session_token; hermes_cli/web_server.py
+#                      _has_valid_session_token). /api/_mock/ and /mock/ stay open for the tests.
+#   bearers            behind the gate, a refused bearer is 401 {"error": "session_expired", "detail": "Unauthorized",
+#                      "reason": "invalid_or_expired_session"} (hermes_cli/dashboard_auth/middleware.py _unauth_response).
+#                      POST /api/_mock/expire-sessions stands for the move: the old dashboard's tokens were never recorded
+#                      by the new listener (hermes_cli/webapp_sign_in.py token_works_alone).
+#   config.set model   4001 use_session_mutation_model (gateway/session_busy_controls.py busy_config). The pick is
+#                      session.mutate operation "model", payload {model, provider?, confirm?, reasoning?}, every value a
+#                      non-empty string (persistence/authority/runtime.py _parse_model), with expected_generation
+#                      (gateway/session_mutations.py _mutate_session, _POLICY). A model named in MOCK_CONFIRM_MODELS (comma
+#                      words, default "mock-premium-model") answers {status: "confirmation_required", confirm_required:
+#                      true, confirm: <token>, target_model, target_provider, confirm_message, warnings} until that token
+#                      comes back in payload.confirm (gateway/session_mutation_model.py _selection_guard_refusal), and
+#                      /api/model/options lists those models under the current provider so a picker can choose one. On a
+#                      running session the pick is deferred to the next turn: {session_id, operation, status: "deferred",
+#                      model, revision, execution_generation}, the fences as they stand, since nothing is applied yet
+#                      (persistence/sqlite/authority/_runtime_picks.py defer_pick). Applied: the receipt {session_id,
+#                      revision, execution_generation, operation, ...} (persistence/sqlite/authority/_mutation.py), every
+#                      operation's, then session.updated with it (session_mutations.py) and session.info with the model
+#                      (_project_committed).
+#   config.set yolo    with a scope other than "global": 4001 invalid_params (gateway/session_tui_config.py
+#                      _set_command_setting); with no scope it is the session's own yolo, served.
+#   pdf.attach         4001 "session not found": the legacy fallback's lookup never holds an authority session
+#                      (tui_gateway/ws_legacy_fallback.py; tui_gateway/session_registry.py _sess_nowait).
+#   image.attach_bytes staged only, {attached, path, mime, name, count, remainder, text, bytes} (gateway/session_images.py):
+#                      nothing reaches the turn unless prompt.submit carries attachments [{path, mime}], which
+#                      AUTHORITY_LOG["submits"] records (GET /api/_mock/authority).
+#   a failed turn      the prompt "fail turn": message.complete {text: "", status: "error", failure_reason, error_surface}
+#                      with no "error" string (gateway/session_settlement_recovery.py).
+#   other bots         a socket call naming a profile in MOCK_UNSERVED_PROFILES (comma words) is 4001 profile_mismatch
+#                      before any handler (gateway/session_controls.py _sibling_for).
+#   groups.create      with no room_id: 4001 invalid_params (the mock's word: Hermes turns the room id check into a 4001,
+#                      gateway/session_group_controls.py; its reason text is unconfirmed).
+#   a replay gap       GET /mock/replay-gap?session=<stored id or title words>: each member of that chat gets
+#                      session.replay_gap {replay_epoch, latest_seq}, and its subscription ends (gateway/session_events.py).
+# In every mode, GET /mock/fault?mode=draining&count=S: for S seconds (default 10) every /api/ call answers 503
+# {"error": "gateway_not_ready", "state": "draining"} and every /api/ws upgrade is answered HTTP 403 before any accept
+# (Hermes closes it 1013 before the accept), the open sockets dropped first; then the mode goes back to none by itself
+# (gateway/run_api.py _serve). GET /mock/fault?mode=starting&count=S is
+# the new process starting: the same 503 with "state": "starting", and every /api/ws upgrade answered HTTP 403 before any
+# accept, as a close sent before the accept is (gateway/run_api.py _serve and its "got its 403 out" comment).
+MIGRATED = "--migrated" in sys.argv
+MIGRATED_TOKEN = ["mock-webapp-token"]   # set from --migrated-token in main()
+MIGRATED_UNSERVED = {w.strip() for w in os.environ.get("MOCK_UNSERVED_PROFILES", "").split(",") if w.strip()}
+MIGRATED_CONFIRM = {w.strip() for w in os.environ.get("MOCK_CONFIRM_MODELS", "mock-premium-model").split(",") if w.strip()}
+MIGRATED_EPOCH = ["mockepoch1"]
+MIGRATED_MODELS: dict = {}   # live session id (or stored id) -> (model, provider) a --migrated session.mutate applied
 GENERATIONS: dict = {}   # live session id -> its newest execution generation
 PROMPTS: dict = {}       # prompt id -> (live session id, the prompt as published, the future its answer settles)
 REVISIONS: dict = {}     # live session id (or a stored id never opened) -> its revision (#666)
@@ -1853,6 +1911,10 @@ def auth_rest(method: str, base: str, query: dict, payload: dict, headers) -> tu
     bearer = headers.get("Authorization", "") or ""
     if base.startswith("/api/") and base not in PUBLIC_API and bearer.startswith("Bearer "):
         if bearer[len("Bearer "):] not in ACCESS_TOKENS:
+            if MIGRATED:
+                # --migrated: the Webapp's refusal of a bearer it didn't issue (dashboard_auth/middleware.py).
+                return 401, {"error": "session_expired", "detail": "Unauthorized", "reason": "invalid_or_expired_session",
+                             "login_url": "/login"}
             return 401, {"detail": "Not authenticated"}
         if base == "/api/auth/me":
             return 200, {"user_id": PASSWORD_AUTH["username"], "provider": "basic", "display_name": PASSWORD_AUTH["username"]}
@@ -1904,6 +1966,11 @@ def model_options() -> dict:
                           "featured_models": big[:6], "models": big[:split]})
         providers.append({"slug": "together", "name": "Together", "authenticated": True,
                           "featured_models": big[split:split + 4], "models": big[split:]})
+    if MIGRATED:
+        # --migrated: the models that ask before they apply are listed under the current provider, for a picker.
+        current = next((pr for pr in providers if pr["slug"] == PROVIDER), None)
+        if current is not None:
+            current["models"] += sorted(m for m in MIGRATED_CONFIRM if m not in current["models"])
     if DROPPED_MODELS:
         for pr in providers:
             pr["models"] = [m for m in pr["models"] if m not in DROPPED_MODELS]
@@ -1988,6 +2055,12 @@ async def _fault(request) -> Response | None:
         return _cloudflare_page(FAULT["status"], f"Error {FAULT['status']}", "Origin is unreachable.")
     if mode == "stall":
         await asyncio.sleep(600)
+    if mode in ("starting", "draining") and base == "/api/ws":
+        # Hermes closes the upgrade 1013 before accepting it while it isn't ready or is draining (gateway/run_api.py
+        # _serve), which reaches the client as HTTP 403 ("got its 403 out").
+        return Response(403, "Forbidden", Headers([("Content-Length", "0")]), b"")
+    if mode in ("starting", "draining") and base.startswith("/api/"):
+        return _json_response(503, {"error": "gateway_not_ready", "state": mode})
     return None
 
 
@@ -2007,7 +2080,14 @@ async def process_request(connection, request):
         FAULT["mode"] = q.get("mode", "none") or "none"
         FAULT["status"] = int(q["status"]) if q.get("status", "").isdigit() else 523
         FAULT["count"] = int(q["count"]) if q.get("count", "").isdigit() else (
-            30 if FAULT["mode"] == "ready-held" else 1 if FAULT["mode"] in ("ticket-expired", "resume-refused", "drop-on-resume") else 0)
+            30 if FAULT["mode"] == "ready-held" else 10 if FAULT["mode"] in ("draining", "starting")
+            else 1 if FAULT["mode"] in ("ticket-expired", "resume-refused", "drop-on-resume") else 0)
+        if FAULT["mode"] in ("draining", "starting"):
+            # The restart's windows, in any mode: back to none by itself after count seconds. Each set has its own
+            # number, so an earlier window's timer never ends a later one.
+            FAULT["window"] = FAULT.get("window", 0) + 1
+            window = FAULT["window"]
+            asyncio.get_running_loop().call_later(FAULT["count"], lambda: FAULT.update(mode="none") if FAULT.get("window") == window else None)
         if FAULT["mode"] == "ready-held":
             HELD["release"] = asyncio.Event()
             asyncio.get_running_loop().call_later(FAULT["count"], release_held, "its time is up", HELD["release"])
@@ -2021,6 +2101,23 @@ async def process_request(connection, request):
     if base == "/mock/fault-state":
         body = json.dumps(FAULT).encode()
         return Response(200, "OK", Headers([("Content-Type", "application/json"), ("Content-Length", str(len(body)))]), body)
+    if base == "/mock/replay-gap":
+        # --migrated: a socket's event backlog overflowed (gateway/session_events.py): each member of the chat gets
+        # session.replay_gap and its subscription ends; the socket itself stays up.
+        q = dict(pair.partition("=")[::2] for pair in request.path.split("?", 1)[1].split("&")) if "?" in request.path else {}
+        want = unquote(q.get("session", "")).replace("+", " ")
+        live = next((s for s in LIVE.values() if want and (s.stored == want or want.lower() in (s.title or "").lower())), None)
+        told = 0
+        for member in list(live.members) if live is not None else []:
+            await member.send({"jsonrpc": "2.0", "method": "event", "params": {
+                "type": "session.replay_gap", "session_id": live.sid,
+                "payload": {"replay_epoch": MIGRATED_EPOCH[0], "latest_seq": 0}}})
+            member.subscriptions.pop(live.sid, None)
+            live.members.discard(member)
+            told += 1
+        print(f"[mock] replay-gap {want!r}: {told} member(s) told, their subscriptions ended", flush=True)
+        body = json.dumps({"ok": live is not None, "told": told}).encode()
+        return Response(200 if live is not None else 404, "OK", Headers([("Content-Type", "application/json"), ("Content-Length", str(len(body)))]), body)
     if base == "/mock/touch":
         # Test only (#423): a chat changed on the gateway while the app is away (GET /mock/touch?title=…&preview=…),
         # for a return to show it without being asked.
@@ -2125,6 +2222,14 @@ def _process_request(connection, request):
     except (json.JSONDecodeError, UnicodeDecodeError):
         body_json = {}
     auth = auth_rest(method, base, query, body_json if isinstance(body_json, dict) else {}, request.headers)
+    if (auth is None and MIGRATED and not PASSWORD_AUTH["enabled"] and base.startswith("/api/") and base not in PUBLIC_API
+            and not base.startswith("/api/_mock/")):
+        # --migrated with no gate: only the Webapp's own session token (hermes_cli/web_server.py _has_valid_session_token).
+        sent = request.headers.get("X-Hermes-Session-Token", "") or ""
+        bearer = request.headers.get("Authorization", "") or ""
+        if sent != MIGRATED_TOKEN[0] and bearer != f"Bearer {MIGRATED_TOKEN[0]}":
+            print(f"[mock] --migrated: {method} {base} refused 401 (not the Webapp's session token)", flush=True)
+            auth = (401, {"detail": "Unauthorized"})
     if auth is not None:
         result = auth
     elif method == "GET" and base == "/api/files/download":
@@ -2293,6 +2398,9 @@ class Session:
         self.stopping = False                         # set by that Stop, so the turn ends "interrupted"
         self.turn_started_at = 0.0
         self.turn_base = 0                 # where the running turn's rows start in `history`
+        # --authority: the admitted prompt waiting for or running its turn, as the authority lists it to every viewer
+        # (gateway/session_authority.py _pending_receipt); one at a time here.
+        self.admission: dict | None = None
         self.pending: dict[str, asyncio.Future] = {}   # open server→client requests
         self.open_frames: dict[str, dict] = {}         # their frames, replayed on resume
         self.db_rows: list[dict] = []      # the messages table's rows for this chat (REST /messages)
@@ -2541,13 +2649,18 @@ class Gateway:
             s.running = False
             s.turn_task = None
             s.inflight = None
+            # Settled: the admission leaves the pending list.
+            s.admission = None
             if AUTHORITY:
                 await self.authority_info(s)
 
     async def authority_info(self, s: Session) -> None:
-        """--authority: the partial session.info a claim and a settle publish, the one place a viewer learns the
-        revision a mutate must present (#666)."""
-        await self.event("session.info", s.sid, {"stored_session_id": s.stored, "pending": [], "running": s.running,
+        """--authority: the partial session.info an admission, a claim and a settle publish, the one place a viewer
+        learns the revision a mutate must present (#666), and every viewer the pending admission with its public text
+        and input id (gateway/session_authority.py _publish_pending): another client's prompt reaches a viewer only
+        there, since a claim's message.start carries nothing of a person's prompt."""
+        await self.event("session.info", s.sid, {"stored_session_id": s.stored,
+                                                 "pending": [dict(s.admission)] if s.admission else [], "running": s.running,
                                                  "authority_epoch": 1, "desktop_protocol": "hermes-gateway-v1",
                                                  "execution_generation": GENERATIONS.get(s.sid, 0),
                                                  "revision": REVISIONS.get(s.sid, 0)})
@@ -2627,9 +2740,13 @@ class Gateway:
             REVISIONS.setdefault(key, 1)
             GENERATIONS.setdefault(key, 1)
         operation, payload = p["operation"], p["payload"]
-        needs_generation = operation in ("rewind", "workspace")
+        # --migrated: model is a policy operation, so it needs the generation too (gateway/session_mutations.py _POLICY).
+        needs_generation = operation in ("rewind", "workspace") or (MIGRATED and operation == "model")
         valid = isinstance(payload, dict) and (
-            (operation == "rename" and set(payload) == {"title"} and isinstance(payload["title"], str))
+            (MIGRATED and operation == "model" and "model" in payload
+             and not set(payload) - {"model", "provider", "confirm", "reasoning"}
+             and all(isinstance(v, str) and v.strip() for v in payload.values()))
+            or (operation == "rename" and set(payload) == {"title"} and isinstance(payload["title"], str))
             or (operation == "rewind" and "target_message_id" in payload
                 and not set(payload) - {"target_message_id", "preserve_compaction_handoff"}
                 and type(payload["target_message_id"]) is int and payload["target_message_id"] > 0)
@@ -2640,10 +2757,37 @@ class Gateway:
             return fenced("revision_conflict", key)
         if needs_generation and p.get("expected_generation") != GENERATIONS.get(key, 0):
             return fenced("stale_generation", key)
+        if MIGRATED and operation == "model":
+            picked, provider = payload["model"].strip(), (payload.get("provider") or "").strip()
+            if picked in MIGRATED_CONFIRM:
+                # The selection guard (gateway/session_mutation_model.py _selection_guard_refusal): a token bound to the
+                # target, the session and its revision; only that token in payload.confirm applies it. Nothing is written.
+                token = hashlib.sha256(json.dumps([picked, provider, key, REVISIONS.get(key, 0)]).encode()).hexdigest()
+                if payload.get("confirm") != token:
+                    print(f"[mock] --migrated: session.mutate model {picked!r} needs confirmation", flush=True)
+                    return ok({"status": "confirmation_required", "confirm_required": True, "confirm": token,
+                               "target_model": picked, "target_provider": provider or PROVIDER,
+                               "confirm_message": f"{picked} costs much more per token than the current model.",
+                               "warnings": [{"kind": "cost", "title": "Expensive model",
+                                             "message": f"{picked} costs much more per token than the current model."}]})
+            if live is not None and live.running:
+                # A pick on a running session is for the next turn (persistence/sqlite/authority/_runtime_picks.py
+                # defer_pick): the fences as they stand, since nothing is applied yet. The receipt is written, so an exact
+                # retry answers the same.
+                result = {"session_id": sid_asked, "operation": "model", "status": "deferred", "model": picked,
+                          "revision": REVISIONS.get(key, 0), "execution_generation": GENERATIONS.get(key, 0)}
+                RECEIPTS[p["request_id"]] = result
+                AUTHORITY_LOG["mutations"].append({**result, "request_id": p["request_id"], "at": time.time()})
+                print(f"[mock] --migrated: session.mutate model {picked!r} deferred (a turn is running)", flush=True)
+                return ok(result)
         if needs_generation and live is not None and live.running:
             return refused("session_busy")
         result = {"session_id": sid_asked, "operation": operation}
-        if operation == "rename":
+        if MIGRATED and operation == "model":
+            picked, provider = payload["model"].strip(), (payload.get("provider") or "").strip() or PROVIDER
+            MIGRATED_MODELS[key] = (picked, provider)
+            result.update(model=picked, provider=provider)
+        elif operation == "rename":
             title = payload["title"]
             if live is not None:
                 live.title = title
@@ -2676,6 +2820,9 @@ class Gateway:
             print(f"moved {row['id']} to {cwd}", flush=True)
         REVISIONS[key] = REVISIONS.get(key, 0) + 1
         result["revision"] = REVISIONS[key]
+        if MIGRATED:
+            # v0.23.4's receipt carries the generation too (persistence/sqlite/authority/_mutation.py).
+            result["execution_generation"] = GENERATIONS.get(key, 0)
         RECEIPTS[p["request_id"]] = result
         AUTHORITY_LOG["mutations"].append({**result, "request_id": p["request_id"], "at": time.time()})
         print(f"session.mutate {operation} {sid_asked} revision={result['revision']}", flush=True)
@@ -2683,6 +2830,15 @@ class Gateway:
             # A committed edit publishes the session's whole info (gateway/session_mutations.py _project_committed).
             await self.event("session.info", live.sid, {**session_info(live.title, live.running, live.profile),
                                                         "execution_generation": GENERATIONS.get(key, 0), "revision": REVISIONS[key]})
+        if MIGRATED and live is not None:
+            # v0.23.4 publishes the applied receipt as session.updated (gateway/session_mutations.py), and a model pick's
+            # info with the model (_project_committed).
+            await self.event("session.updated", live.sid, result)
+            if operation == "model":
+                picked, provider = MIGRATED_MODELS[key]
+                await self.event("session.info", live.sid, {**session_info(live.title, live.running, live.profile),
+                                                            "model": picked, "provider": provider,
+                                                            "execution_generation": GENERATIONS.get(key, 0), "revision": REVISIONS[key]})
         return ok(result)
 
     @staticmethod
@@ -3138,6 +3294,10 @@ class Gateway:
                 if owner == s.sid:
                     PROMPTS.pop(pid, None)
                     await self.event(f"{pr['kind']}.settled", s.sid, {"prompt_id": pid, "execution_generation": pr["execution_generation"]})
+            # The claim: the admission reads started, under the execution that runs it (session_authority.py _stamp_claim).
+            if s.admission:
+                s.admission["status"] = "started"
+                s.admission["execution_generation"] = GENERATIONS[s.sid]
             await self.authority_info(s)
         await asyncio.sleep(0.4)
         # A turn of many tool calls, for the thread's layout checks.
@@ -3258,6 +3418,15 @@ class Gateway:
             self.store_turn(s, prompt, [text])
             s.inflight = None
             await self.event("message.complete", s.sid, {"text": text, "status": "complete", "usage": usage(s.output_tokens, 1)})
+            return
+        if MIGRATED and prompt.strip().lower().startswith("fail turn"):
+            # --migrated: a turn the provider refused, as the authority settles it (gateway/session_settlement_recovery.py):
+            # status "error", failure_reason and error_surface, and no "error" string.
+            s.inflight = None
+            await self.event("message.complete", s.sid, {
+                "text": "", "content": "", "status": "error", "usage": usage(s.output_tokens, 1),
+                "failure_reason": "The model provider refused the request: the API key was rejected (mock).",
+                "error_surface": {"code": "provider_auth"}})
             return
         if prompt.strip().lower().startswith("fail"):
             # The bot's provider needs a CLI the gateway does not have (a tester's Claude
@@ -3432,6 +3601,11 @@ class Gateway:
         def err(code: int, message: str) -> dict:
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
+        # --migrated: a bot this gateway doesn't serve is refused before the key check and any handler or fallback
+        # (gateway/session_controls.py dispatch, _sibling_for).
+        if MIGRATED and isinstance(p, dict) and isinstance(p.get("profile"), str) and p["profile"] in MIGRATED_UNSERVED:
+            print(f"[mock] --migrated: {method} refused profile_mismatch (profile {p['profile']!r} isn't served)", flush=True)
+            return refused("profile_mismatch")
         if STRICT_PARAMS and method in STRICT_PARAMS_DECLARED and isinstance(p, dict):
             unknown = sorted(set(p) - STRICT_PARAMS_DECLARED[method])
             if unknown:
@@ -3457,6 +3631,11 @@ class Gateway:
             return ok({"protocol_version": 1, "driver": True, "methods": ["groups.list", "groups.create", "groups.send", "groups.log"]})
         if method == "groups.list":
             return ok({"rooms": ROOMS, "next_offset": None})
+        if MIGRATED and method == "groups.create" and not (isinstance(p.get("room_id"), str) and p["room_id"]):
+            # --migrated: the room id is required (contracts/groups_bot_relay.py; the check is the handler's). The reason
+            # text is the mock's word.
+            print("[mock] --migrated: groups.create refused invalid_params (no room_id)", flush=True)
+            return refused("invalid_params")
         if method == "groups.create":
             members = [{"member_id": f"m{i + 1}", "profile": m.get("profile"), "handle": m.get("handle") or m.get("profile"),
                         "display_name": (m.get("handle") or m.get("profile") or "").capitalize()} for i, m in enumerate(p.get("members") or [])] \
@@ -3780,7 +3959,10 @@ class Gateway:
                     print(f"[mock] prompt.submit refused invalid_params: keys {sorted(q)}", flush=True)
                     return refused("invalid_params")
                 AUTHORITY_LOG["submits"].append({"session_id": q.get("session_id"), "input_id": q.get("input_id"),
-                                                 "submission_id": q.get("submission_id"), "at": time.time()})
+                                                 "submission_id": q.get("submission_id"), "at": time.time(),
+                                                 "text": q.get("text"),
+                                                 # --migrated: what reaches the turn (gateway/session_ingress_media.py).
+                                                 "attachments": q.get("attachments") or []})
                 print(f"[mock] prompt.submit admitted input_id={q.get('input_id')!r}", flush=True)
             s = self.sessions.get(p.get("session_id", ""))
             if s is None:
@@ -3790,11 +3972,22 @@ class Gateway:
             if p.get("surface") or p.get("interrupted"):
                 print(f"prompt.submit surface={p.get('surface')!r} interrupted={bool(p.get('interrupted'))} "
                       f"voice_context={len(str(p.get('voice_context') or ''))} chars", flush=True)
+            admission_id = uuid.uuid4().hex
+            if AUTHORITY:
+                # The admission, listed to every viewer at once (session_authority.py _admitted): its public text and
+                # the id its sender named it by, which the authority stores as its request id (session_controls.py
+                # submission()).
+                s.admission = {"admission_id": admission_id, "ref": {"session_id": s.stored},
+                               "sequence": len(AUTHORITY_LOG["submits"]), "status": "queued", "outcome": None,
+                               "authority_epoch": 1, "execution_generation": None,
+                               "input_id": p.get("submission_id") or p.get("input_id"), "text": str(p.get("text", "")),
+                               "controls": [], "steering": False}
+                await self.authority_info(s)
             asyncio.create_task(self.run_turn(s, str(p.get("text", ""))))
             if AUTHORITY:
                 # The authority's receipt (gateway/session_authority.py _receipt): every admitted message is "queued" in
                 # its own queue, even one whose turn starts at once (#682).
-                return ok({"admission_id": uuid.uuid4().hex, "status": "queued"})
+                return ok({"admission_id": admission_id, "status": "queued"})
             return ok({"status": "streaming"})
         if method == "session.interrupt":
             s = self.sessions.get(p.get("session_id", ""))
@@ -3870,6 +4063,15 @@ class Gateway:
                 s.inflight["corrections"] = [*(s.inflight.get("corrections") or []), text]
             print(f"session.steer {text!r} session={s.sid}", flush=True)
             return ok({"status": "queued", "text": text})
+        if MIGRATED and method == "config.set":
+            # --migrated: a model pick is session.mutate's (gateway/session_busy_controls.py busy_config); yolo with a scope
+            # is the slash command's, which takes only "global" (gateway/session_tui_config.py _set_command_setting).
+            if p.get("key") == "model":
+                print(f"[mock] --migrated: config.set model refused use_session_mutation_model", flush=True)
+                return refused("use_session_mutation_model")
+            if p.get("key") == "yolo" and "scope" in p and p.get("scope") != "global":
+                print(f"[mock] --migrated: config.set yolo scope={p.get('scope')!r} refused invalid_params", flush=True)
+                return refused("invalid_params")
         if method == "config.set":
             s = self.sessions.get(p.get("session_id", ""))
             # Voice mode's quick answers set reasoning and fast for the session and put them back.
@@ -3938,6 +4140,35 @@ class Gateway:
             return ok({"resolved": 0})
         if method == "approval.received":
             return ok({"acknowledged": True})
+        if MIGRATED and method == "pdf.attach":
+            # --migrated: no authority handler; the legacy fallback's lookup never holds an authority session
+            # (tui_gateway/session_registry.py: _err(rid, 4001, "session not found")).
+            print("[mock] --migrated: pdf.attach refused 4001 session not found", flush=True)
+            return err(4001, "session not found")
+        if MIGRATED and method == "image.attach_bytes":
+            # --migrated: staged only (gateway/session_images.py); the turn gets it only by prompt.submit's attachments.
+            sid_asked = p.get("session_id", "")
+            if (not isinstance(sid_asked, str) or not sid_asked
+                    or set(p) - {"session_id", "profile", "content_base64", "data", "filename", "ext"}
+                    or any(not isinstance(v, str) for v in p.values())):
+                return refused("invalid_params")
+            if sid_asked not in self.subscriptions:
+                return refused("permission_denied")
+            name = p.get("filename", "") or "upload.png"
+            ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ".png"
+            mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}.get(ext)
+            raw = p.get("content_base64") or p.get("data") or ""
+            try:
+                size = len(base64.b64decode(raw.split(",", 1)[-1], validate=False))
+            except (ValueError, TypeError):
+                size = 0
+            if mime is None or size == 0:
+                return refused("invalid_params")
+            staged = f"upload_{uuid.uuid4().hex[:12]}{ext}"
+            path = f"/home/hermes/.hermes/cache/images/{staged}"
+            print(f"[mock] --migrated: image.attach_bytes staged {path} ({size} bytes); nothing queued", flush=True)
+            return ok({"attached": True, "path": path, "mime": mime, "name": staged, "count": 1, "remainder": "",
+                       "text": f"[User attached image: {staged}]", "bytes": size})
         if method in ("image.attach_bytes", "pdf.attach"):
             # The real gateway writes the image into the profile's images dir and says where.
             name = p.get("filename", "") or "upload.png"
@@ -3973,6 +4204,13 @@ async def ws_handler(ws):
             FAULT["mode"] = "none"
         await ws.close(4401, "ticket expired")
         return
+    if MIGRATED and not PASSWORD_AUTH["enabled"]:
+        # --migrated with no gate: ?token= must be the Webapp's own (hermes_cli/web_server_chat.py), else 4401.
+        q = dict(pair.partition("=")[::2] for pair in req_path.split("?", 1)[1].split("&")) if "?" in req_path else {}
+        if unquote(q.get("token", "")) != MIGRATED_TOKEN[0]:
+            print("[mock] --migrated: upgrade closed 4401 (not the Webapp's session token)", flush=True)
+            await ws.close(4401, "Unauthorized")
+            return
     gw = Gateway(ws)
     GATEWAYS.add(gw)
     held = HELD.get("release")
@@ -4035,6 +4273,8 @@ async def main() -> None:
     ap.add_argument("--no-pins", action="store_true", help="no pins, as a gateway from before Hermes kept them: rows without \"pinned\", a PATCH of only a pin refused")
     ap.add_argument("--strict-params", action="store_true", help="refuse undeclared keys on the canonical methods as Hermes v0.23.0's session authority does: 4001 invalid_params (#665)")
     ap.add_argument("--authority", action="store_true", help="a Hermes v0.23.0 session authority: approvals and single questions by event, answered with approval.respond / clarify.respond (implies --strict-params; #665)")
+    ap.add_argument("--migrated", action="store_true", help="a gateway after Hermes v0.23.4's gateway migrate --backends --apply: the Webapp's session token, the authority on every socket and its v0.23.4 rules (implies --authority; the comment above MIGRATED)")
+    ap.add_argument("--migrated-token", default="mock-webapp-token", help="with --migrated: the Webapp's own session token (the one in <home>/webapp/session-token)")
     ap.add_argument("--password-auth", metavar="USER:PASSWORD", help="also take a username/password sign-in (auth gate on)")
     ap.add_argument("--extra-sessions", type=int, default=0, metavar="N", help="N more stored chats with the default bot (a long list for the bot-motion clips)")
     ap.add_argument("--cron-sessions", type=int, default=0, metavar="N", help="a busy gateway's scheduled tasks (#673): N empty runs 5 minutes apart, three with replies, and a chat of the person's two days old; the session list's page cut at its limit")
@@ -4072,6 +4312,7 @@ async def main() -> None:
             STORED_SESSIONS.append(row); SEEDED_IDS.add(row["id"])
     global TOKEN
     TOKEN = args.token
+    MIGRATED_TOKEN[0] = args.migrated_token
     if args.password_auth:
         user, _, password = args.password_auth.partition(":")
         PASSWORD_AUTH.update(enabled=True, username=user, password=password)
@@ -4079,6 +4320,9 @@ async def main() -> None:
     LISTEN_HOST = args.host
     LISTEN_PORTS[:] = [args.port] + ([args.port2] if args.port2 else [])
     print(f"mock Hermes gateway on http://{args.host}:{args.port}" + (f" and :{args.port2}" if args.port2 else "") + f"  (session token: {TOKEN})", flush=True)
+    if MIGRATED:
+        print(f"mock --migrated: the Webapp's session token is {MIGRATED_TOKEN[0]} (the one above is refused with no gate);"
+              f" unserved bots {sorted(MIGRATED_UNSERVED) or 'none'}; confirm models {sorted(MIGRATED_CONFIRM)}", flush=True)
     for port in LISTEN_PORTS:
         await listen(port)
     await asyncio.Future()

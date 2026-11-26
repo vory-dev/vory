@@ -29,6 +29,9 @@ struct ProfileInfoSheet: View {
         }
         .presentationDetents([.medium, .large], selection: $detent)
         .presentationDragIndicator(.visible)
+        // A pick from the card's Model row the gateway asks about is asked here, over the card: the chat under it can't
+        // present it. With no chat (a bot's card from the Bots page or a mention), the card holds any question until it closes.
+        .modelConfirmationHost(chat, in: .sheet)
         // Up from the chat's face or pill: the face here plays the reaction the sheet covered.
         .background(ArrivalProbe(profile: profileName))
         .onChange(of: model.modelChooser?.id) { _, _ in
@@ -234,6 +237,7 @@ struct ProfileCardView: View {
                     LabeledContent("Model", value: chat.modelName.isEmpty ? "Choose…" : (chat.modelName.split(separator: "/").last.map(String.init) ?? chat.modelName))
                 }
                 .tint(.primary)
+                .accessibilityIdentifier("profile.model")
                 if let u = chat.usage, let pct = u.computedContextPercent {
                     LabeledContent("Context", value: "\(pct)% of \((u.contextMax ?? 0).formatted())")
                 }

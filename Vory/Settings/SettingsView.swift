@@ -275,7 +275,8 @@ struct GatewaysView: View {
                 if let rt = model.runtime {
                     Button { Task { await rt.reconnectNow() } } label: { Label("Reconnect", systemImage: "arrow.clockwise") }
                     if case .authRejected(let why) = rt.socketState {
-                        Text(why).font(.footnote).foregroundStyle(.red)
+                        Text(ConnectProblem.refusedWords(why: why, authMode: rt.connection.authMode, refreshRefused: rt.refreshRefused))
+                            .font(.footnote).foregroundStyle(.red)
                         NavigationLink("Sign in again") { GatewayFormView(existing: rt.connection).pushedPage(keepsOwnBar: true) }
                     }
                 }

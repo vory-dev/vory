@@ -200,12 +200,22 @@ struct GatewaySignInBanner: View {
     @Environment(AppModel.self) private var model
     var connection: GatewayConnection
 
+    /// The gateway ended this connection's sign-in for good (its refresh was turned down).
+    private var signInEnded: Bool {
+        guard let rt = model.runtime, rt.connection.id == connection.id else { return false }
+        return rt.refreshRefused
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: "person.badge.key.fill").font(.title3).foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Sign in to \(connection.name)").font(.subheadline.weight(.semibold))
-                Text("\(DeviceWords.This) is not signed in to this gateway.").font(.caption).foregroundStyle(.secondary)
+                if signInEnded {
+                    Text(ConnectProblem.signInEnded).font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("\(DeviceWords.This) is not signed in to this gateway.").font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 8)
             Button("Sign In") { model.signInPrompt = [connection] }

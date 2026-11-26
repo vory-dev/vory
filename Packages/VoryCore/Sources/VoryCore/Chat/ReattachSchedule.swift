@@ -40,6 +40,35 @@ public enum ReattachShow: Equatable, Sendable {
     case none, reconnecting, failed
 }
 
+/// How a chat attaches again after a replay gap: the gateway ending this socket's subscription to it when its event
+/// backlog overflowed, the socket itself still up. Pure; the chat holds the stretch.
+public enum GapPacing {
+    /// Gaps closer than this to the last are one stretch: the reconnect schedule's longest wait.
+    public static let window: Double = 30
+
+    public enum Decision: Equatable, Sendable {
+        /// Attach again now.
+        case now
+        /// Attach again after this long, before the schedule's jitter.
+        case after(Double)
+        /// A re-attach for a gap is in flight: one more follows it, after its wait.
+        case afterTheOneInFlight
+    }
+
+    /// What a gap at `now` does, and the stretch's count with it, given when the stretch's last gap came, how many it
+    /// has had, and whether a re-attach for one is still in flight.
+    /// - A stretch's first gap attaches again now. A stretch ends after `window` with no gap.
+    /// - Never two re-attaches at once: a gap while one is in flight marks one more, to follow it after its wait.
+    /// - The stretch's nth gap otherwise waits the reconnect schedule's delay after n - 1 failures: 2, 5, 10, 20, then
+    ///   30 s. A socket that keeps falling behind attaches again as a failing reconnect would, not in a storm.
+    public static func decision(lastGapAt: Date?, streak: Int, inFlight: Bool, now: Date) -> (decision: Decision, streak: Int) {
+        let inStretch = lastGapAt.map { now.timeIntervalSince($0) < window } ?? false
+        let n = inStretch ? streak + 1 : 1
+        if inFlight { return (.afterTheOneInFlight, n) }
+        return (n == 1 ? .now : .after(ReattachSchedule.delay(afterFailures: n - 1)), n)
+    }
+}
+
 /// The re-attach's clock: the real one in the app, a manual one in the tests.
 public struct ReattachClock: Sendable {
     public var now: @Sendable () -> Date

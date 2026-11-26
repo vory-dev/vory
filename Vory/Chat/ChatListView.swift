@@ -657,7 +657,7 @@ struct ChatListView: View {
     private func connectionSymbol(_ s: SocketState) -> String {
         switch s {
         case .open: return "checkmark.circle.fill"
-        case .connecting, .reconnecting: return "arrow.triangle.2.circlepath"
+        case .connecting, .reconnecting, .unreachable(.restarting, _): return "arrow.triangle.2.circlepath"
         case .authRejected, .failed: return "xmark.octagon.fill"
         case .unreachable: return "exclamationmark.triangle.fill"
         case .idle: return "circle"
@@ -2014,7 +2014,7 @@ struct ChatListProfileItems: View {
     private func connectionSymbol(_ s: SocketState) -> String {
         switch s {
         case .open: return "checkmark.circle.fill"
-        case .connecting, .reconnecting: return "arrow.triangle.2.circlepath"
+        case .connecting, .reconnecting, .unreachable(.restarting, _): return "arrow.triangle.2.circlepath"
         case .authRejected, .failed: return "xmark.octagon.fill"
         case .unreachable: return "exclamationmark.triangle.fill"
         case .idle: return "circle"

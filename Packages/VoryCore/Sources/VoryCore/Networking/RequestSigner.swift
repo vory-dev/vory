@@ -50,9 +50,9 @@ public struct RequestSigner: Hashable, Sendable {
     }
 
     public static func websocketURL(gateway: GatewayURL, token: String?, ticket: String?) -> URL {
-        var items: [URLQueryItem] = []
-        if let ticket, !ticket.isEmpty { items.append(URLQueryItem(name: "ticket", value: ticket)) }
-        else if let token, !token.isEmpty { items.append(URLQueryItem(name: "token", value: token)) }
-        return gateway.websocket("/api/ws", query: items)
+        var credential: URLQueryItem?
+        if let ticket, !ticket.isEmpty { credential = URLQueryItem(name: "ticket", value: ticket) }
+        else if let token, !token.isEmpty { credential = URLQueryItem(name: "token", value: token) }
+        return gateway.websocket("/api/ws", credential: credential)
     }
 }

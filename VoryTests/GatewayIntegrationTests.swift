@@ -377,10 +377,12 @@ extension GatewayIntegrationTests {
     struct E2ERuntime { let runtime: GatewayRuntime; let store: ConnectionStore; let conn: GatewayConnection }
 
     @MainActor private func e2eRuntime(_ name: String) async throws -> E2ERuntime? {
-        guard let env = Self.env, env.token == "mock-token" else { return nil }
+        // The mock only: its own token, or any sign-in on a mock whose wire the run names (HERMES_E2E_WIRE).
+        guard let c = E2EConfig.load(), c.token == "mock-token" || E2EWire.current != nil else { return nil }
+        let r = try await c.resolve()
         let store = ConnectionStore()
-        let conn = GatewayConnection(name: name, gateway: try GatewayURL.normalize(env.url), authMode: .sessionToken)
-        try store.upsert(conn, secrets: GatewaySecrets(sessionToken: env.token))
+        let conn = GatewayConnection(name: name, gateway: r.gateway, authMode: r.mode)
+        try store.upsert(conn, secrets: r.secrets)
         let runtime = GatewayRuntime(connection: conn, store: store)
         await runtime.start()
         return E2ERuntime(runtime: runtime, store: store, conn: conn)

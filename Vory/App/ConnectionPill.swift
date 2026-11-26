@@ -16,7 +16,8 @@ struct ConnectionPill: View {
     private var color: Color {
         switch state {
         case .open: return .green
-        case .connecting, .reconnecting: return .orange
+        // A restart reads as reconnecting: the gateway is coming back.
+        case .connecting, .reconnecting, .unreachable(.restarting, _): return .orange
         case .authRejected, .failed, .unreachable: return .red
         case .idle: return .gray
         }

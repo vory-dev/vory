@@ -63,6 +63,8 @@ public actor GatewaySocket {
     public typealias StateSink = @Sendable (SocketState) -> Void
     public typealias RequestHandler = @Sendable (ServerRequest) async -> JSONValue?
     public typealias ReconnectHook = @Sendable () async -> Void
+    /// Asks a gateway's status read (`statusRequest`) and gives its HTTP status and body, or nil when nothing answered.
+    public typealias StatusAsk = @Sendable (URLRequest) async -> (status: Int, body: Data)?
 
     private let log = Logger(subsystem: "Vory", category: "ws")
     private let urlProvider: URLProvider
@@ -112,6 +114,12 @@ public actor GatewaySocket {
     private var ticketRetried = false
     /// The address and ticket step failed without an answer on the previous attempt too.
     private var addressStepNoAnswer = false
+    /// When the gateway last showed it's restarting (`problem(for:...)`), while that still holds.
+    private var restartSeenAt: Date?
+    /// Whether each attempt mints a ticket first (a bearer sign-in); a session token goes in the address itself.
+    private let ticketed: Bool
+    /// How a session token's 403 upgrade asks the gateway's status read whether it is restarting (`asksStatus`).
+    private let askStatus: StatusAsk
     private var onTrouble: (@Sendable (ConnectTrouble) async -> Void)?
     /// Attempts in a row that fail the same way before the state names the problem instead of counting attempts, while
     /// the first quick retries run; past them, a problem is named at once.
@@ -137,9 +145,12 @@ public actor GatewaySocket {
     /// the batch later gets everything that arrived in the meantime.
     public init(urlProvider: @escaping URLProvider, onEvents: @escaping EventBatchSink, onState: @escaping StateSink,
          onServerRequest: @escaping RequestHandler, onReconnected: @escaping ReconnectHook,
-         onFirstConnected: @escaping ReconnectHook = {},
-         makePipe: @escaping @Sendable (URLRequest) -> any GatewayFramePipe = { GatewayTransport.network.makeFramePipe($0, nil) }) {
+         onFirstConnected: @escaping ReconnectHook = {}, ticketed: Bool = true,
+         makePipe: @escaping @Sendable (URLRequest) -> any GatewayFramePipe = { GatewayTransport.network.makeFramePipe($0, nil) },
+         askStatus: @escaping StatusAsk = GatewaySocket.askOverNetwork) {
         self.urlProvider = urlProvider
+        self.ticketed = ticketed
+        self.askStatus = askStatus
         self.onEvents = onEvents
         self.onState = onState
         self.onServerRequest = onServerRequest
@@ -222,16 +233,19 @@ public actor GatewaySocket {
             setState(attempt == 1 && !everConnected ? .connecting : .reconnecting(attempt: attempt, delay: 0))
             var failure: Error?
             var addressStepFailed = false
+            var address: (url: URL, headers: [String: String])?
             do {
                 let url: URL, headers: [String: String]
                 do { (url, headers) = try await addressAndTicket() }
                 catch { addressStepFailed = true; throw error }
+                address = (url, headers)
                 try await open(url: url, headers: headers)
                 try await waitUntilReady(timeout: readyTimeoutSeconds)
                 let wasReconnect = everConnected
                 everConnected = true
                 attempt = 0
                 problem = nil; problemStreak = 0
+                restartSeenAt = nil
                 ticketRetried = false
                 addressStepNoAnswer = false
                 if wasReconnect {
@@ -250,6 +264,8 @@ public actor GatewaySocket {
                 return
             } catch let e as HermesAPIError where e.isUnauthorized {
                 teardown(reason: "auth")
+                // A refused sign-in ends any restart hold: the next connect doesn't inherit it.
+                restartSeenAt = nil
                 setState(.authRejected(e.localizedDescription))
                 return
             } catch let e as SocketError {
@@ -262,6 +278,7 @@ public actor GatewaySocket {
                         log.warning("socket refused (4401); once more with a fresh ticket")
                         continue
                     }
+                    restartSeenAt = nil
                     setState(.authRejected(reason.isEmpty ? "The gateway rejected the WebSocket credential (4401)." : reason))
                     return
                 }
@@ -274,7 +291,23 @@ public actor GatewaySocket {
                 log.warning("connect failed: \(error.localizedDescription, privacy: .public)")
             }
             guard wantConnected else { return }
-            let seen = failure.flatMap(ConnectProblem.of)
+            var seen: ConnectProblem?
+            if let failure {
+                // A session token's 403 upgrade with no hold running asks the gateway's own status read, once for this
+                // attempt, at the address in use: Hermes closes an upgrade before accepting it while it isn't ready or
+                // is draining, and a token's mode has no ticket call to tell by. Attempts stay as far apart as ever.
+                var statusSaysRestarting = false
+                if let address, Self.asksStatus(for: failure, ticketed: ticketed, restartSeenAt: restartSeenAt, now: Date()),
+                   let request = Self.statusRequest(upgradeURL: address.url, headers: address.headers),
+                   let answer = await askStatus(request) {
+                    statusSaysRestarting = Self.saysRestarting(status: answer.status, body: answer.body)
+                }
+                guard wantConnected else { return }
+                // A 403 upgrade comes only after the address step: its ticket call, in a ticket's mode, was answered.
+                (seen, restartSeenAt) = Self.problem(for: failure, ticketed: ticketed, ticketMetNotReady: addressStepFailed,
+                                                     statusSaysRestarting: statusSaysRestarting,
+                                                     restartSeenAt: restartSeenAt, now: Date())
+            }
             if let seen, seen == problem { problemStreak += 1 } else { problem = seen; problemStreak = seen == nil ? 0 : 1 }
             // The ticket's REST call went unanswered twice in a row: its connection may be one a network change broke,
             // which only a new session mends (what quitting the app did, #423).
@@ -295,8 +328,9 @@ public actor GatewaySocket {
             let delay = Self.retryDelay(attempt: attempt) * Double.random(in: 0.8...1.2)
             // Named after a few failures in a row while the first quick retries run (a blip at launch says nothing),
             // and at once after that: by then attempts are seconds apart and a new cause is news (Access after an
-            // origin error waited three backed-off attempts, a minute and a half, to be named).
-            if let problem, problemStreak >= Self.problemShownAfter || attempt > Self.problemShownAfter {
+            // origin error waited three backed-off attempts, a minute and a half, to be named). A restart is named at
+            // once: it's the gateway's own word, and the quick retries' red was what made it read as a failure.
+            if let problem, problem == .restarting || problemStreak >= Self.problemShownAfter || attempt > Self.problemShownAfter {
                 setState(.unreachable(problem, attempt: attempt))
             } else {
                 setState(.reconnecting(attempt: attempt, delay: delay))
@@ -344,6 +378,101 @@ public actor GatewaySocket {
     nonisolated static func retryDelay(attempt: Int) -> Double {
         if attempt <= 3 { return 1 }
         return min(30.0, pow(2.0, Double(min(attempt - 3, 5))))
+    }
+
+    /// How long after the restart's last sign a refused or unanswered attempt still reads as the restart.
+    public static let restartHold: Double = 120
+
+    /// The problem a failed attempt names, and the restart hold after it: when the gateway last showed it's
+    /// restarting, or nil. A restarting gateway answers REST 503 gateway_not_ready and closes an open socket 1013, then
+    /// refuses while no process listens, then answers an upgrade 403 before accepting it while the new process starts.
+    /// - A sign of the restart (`ConnectProblem.restarting`) is named so, and the hold runs from now.
+    /// - A sign-in refusal (a 401 or an ended session, a 4401 or 4403 close) or any refusal of a call is never the
+    ///   restart, and ends the hold, so its own words show.
+    /// - Inside the hold, no answer is the restart. So is a 403 upgrade with no ticket call to tell by (a session token:
+    ///   the gateway refuses a wrong one 4401, after the accept), and in a ticket's mode only when that attempt's
+    ///   ticket call met gateway_not_ready. Any other 403 upgrade is the gateway's own, and ends the hold.
+    /// - A session token's 403 upgrade with no hold running is a sign of the restart only when the gateway's own status
+    ///   read says so (`statusSaysRestarting`, from `saysRestarting`): Hermes closes an upgrade before accepting it, a 403
+    ///   to the client, while it isn't ready or is draining. With no such word, the 403 stays the gateway's own.
+    /// - Everything else is named as it always was.
+    nonisolated static func problem(for error: Error, ticketed: Bool, ticketMetNotReady: Bool, statusSaysRestarting: Bool = false,
+                                    restartSeenAt: Date?, now: Date) -> (problem: ConnectProblem?, restartSeenAt: Date?) {
+        let own = ConnectProblem.of(error)
+        if own == .restarting { return (.restarting, now) }
+        if isSignInRefusal(error) { return (own, nil) }
+        if statusSaysRestarting, !ticketed, case .refused(403, _, false, false)? = error as? SocketError { return (.restarting, now) }
+        guard let seen = restartSeenAt, now.timeIntervalSince(seen) <= restartHold else { return (own, nil) }
+        if own == .noAnswer { return (.restarting, seen) }
+        if case .refused(403, _, false, false)? = error as? SocketError {
+            return ticketed && !ticketMetNotReady ? (own, nil) : (.restarting, seen)
+        }
+        return (own, seen)
+    }
+
+    /// A refusal of the sign-in or of a call, which a restart never hides.
+    nonisolated static func isSignInRefusal(_ error: Error) -> Bool {
+        if let e = error as? HermesAPIError { return e.isUnauthorized }
+        if case .closed(let code, _)? = error as? SocketError { return code == 4401 || code == 4403 }
+        return error is RPCError
+    }
+
+    /// Whether a failed attempt asks the gateway's status read first: a session token's 403 upgrade (not Cloudflare's,
+    /// not a web page) with no hold running. Inside a hold the 403 is the restart already, so nothing is asked.
+    nonisolated static func asksStatus(for error: Error, ticketed: Bool, restartSeenAt: Date?, now: Date) -> Bool {
+        guard !ticketed, case .refused(403, _, false, false)? = error as? SocketError else { return false }
+        if let seen = restartSeenAt, now.timeIntervalSince(seen) <= restartHold { return false }
+        return true
+    }
+
+    /// How long the status read waits for an answer.
+    public static let statusAskTimeout: Double = 5
+
+    /// The status read for an upgrade's address: the same host, port and base path, `/api/status`, no query (the
+    /// session token stays out of it), with the attempt's own headers (an Access service token, behind one). Nil for an
+    /// address that isn't a gateway socket's.
+    nonisolated static func statusRequest(upgradeURL: URL, headers: [String: String]) -> URLRequest? {
+        guard var c = URLComponents(url: upgradeURL, resolvingAgainstBaseURL: false) else { return nil }
+        switch c.scheme?.lowercased() {
+        case "ws": c.scheme = "http"
+        case "wss": c.scheme = "https"
+        default: return nil
+        }
+        guard c.path.hasSuffix("/api/ws") else { return nil }
+        c.path = String(c.path.dropLast("/api/ws".count)) + "/api/status"
+        c.query = nil
+        c.fragment = nil
+        guard let url = c.url else { return nil }
+        var r = URLRequest(url: url, timeoutInterval: statusAskTimeout)
+        r.httpMethod = "GET"
+        for (k, v) in headers { r.setValue(v, forHTTPHeaderField: k) }
+        r.setValue("application/json", forHTTPHeaderField: "Accept")
+        return r
+    }
+
+    /// Hermes's own word in its status read that it is restarting: 503 gateway_not_ready while it isn't ready or is
+    /// draining, or, inside a restart's after-turn wait, where the read is let through, a 200 whose gateway_state is
+    /// "draining". Anything else (running, a sign-in page, no JSON) is no such word.
+    nonisolated static func saysRestarting(status: Int, body: Data) -> Bool {
+        guard let o = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return false }
+        switch status {
+        case 503: return o["error"] as? String == "gateway_not_ready"
+        case 200: return o["gateway_state"] as? String == "draining"
+        default: return false
+        }
+    }
+
+    /// Over the network: a session of its own, ephemeral, with no cookies, let go once answered.
+    public static let askOverNetwork: StatusAsk = { request in
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.httpShouldSetCookies = false
+        cfg.waitsForConnectivity = false
+        cfg.timeoutIntervalForRequest = GatewaySocket.statusAskTimeout
+        let session = URLSession(configuration: cfg)
+        defer { session.finishTasksAndInvalidate() }
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse else { return nil }
+        return (http.statusCode, data)
     }
 
     private func open(url: URL, headers: [String: String]) async throws {

@@ -393,12 +393,18 @@ struct ModelSheet: View {
                 catch { self.error = error.localizedDescription }
             }
         }
+        // A pick the gateway asks about is asked here, over the page: the chat under it can't present it.
+        .modelConfirmationHost(chat, in: .sheet, onUse: { dismiss() })
     }
 
     private func pick(_ provider: String, _ model: String) {
         busy = true
         Task {
-            do { try await chat.setModel(provider: provider, model: model); dismiss() }
+            do {
+                try await chat.setModel(provider: provider, model: model)
+                // The gateway asks first: the page stays for its question. Use closes it; Cancel leaves the list up.
+                if chat.pendingModelConfirmation == nil { dismiss() } else { busy = false }
+            }
             catch { chat.banner = error.localizedDescription; busy = false }
         }
     }

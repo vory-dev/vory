@@ -201,6 +201,7 @@ public final class GatewayRuntime {
             },
             onReconnected: { [weak self] in await self?.didReconnect() },
             onFirstConnected: { [weak self] in await self?.didConnectFirst() },
+            ticketed: connection.authMode.usesBearer,
             makePipe: { [transport] in transport.makeFramePipe($0, nil) })
         // An attempt that got no answer from the ticket's REST call twice in a row, or a network change while
         // waiting: the REST session's connections are made afresh, as quitting the app did (#423).
@@ -284,7 +285,8 @@ public final class GatewayRuntime {
         let (authMode, secrets) = await (connection.authMode, self.secrets)
         var ticket: String?
         if authMode.usesBearer {
-            let r: [String: JSONValue] = try await api.send("POST", "/api/auth/ws-ticket", body: EmptyBody(), directOnly: true)
+            // The socket's loop retries by itself, so its ticket call doesn't wait out a restart (`HermesAPI.answered`).
+            let r: [String: JSONValue] = try await api.send("POST", "/api/auth/ws-ticket", body: EmptyBody(), directOnly: true, waitsOutRestart: false)
             ticket = r["ticket"]?.stringValue
         }
         let url = RequestSigner.websocketURL(gateway: gateway, token: secrets.sessionToken, ticket: ticket)
@@ -295,14 +297,15 @@ public final class GatewayRuntime {
     /// same way as the main socket: a minted ticket for bearer gateways, `?token=` otherwise.
     nonisolated func pluginWebsocketURL(path: String, query: [URLQueryItem]) async throws -> (URL, [String: String]) {
         let (gateway, authMode, secrets) = await (address, connection.authMode, self.secrets)
-        var items = query
+        var credential: URLQueryItem?
         if authMode.usesBearer {
-            let r: [String: JSONValue] = try await api.send("POST", "/api/auth/ws-ticket", body: EmptyBody(), directOnly: true)
-            if let t = r["ticket"]?.stringValue, !t.isEmpty { items.append(URLQueryItem(name: "ticket", value: t)) }
+            // Not waited out either: the kanban stream retries by itself, and a reply's speech can't wait for a restart.
+            let r: [String: JSONValue] = try await api.send("POST", "/api/auth/ws-ticket", body: EmptyBody(), directOnly: true, waitsOutRestart: false)
+            if let t = r["ticket"]?.stringValue, !t.isEmpty { credential = URLQueryItem(name: "ticket", value: t) }
         } else if let t = secrets.sessionToken, !t.isEmpty {
-            items.append(URLQueryItem(name: "token", value: t))
+            credential = URLQueryItem(name: "token", value: t)
         }
-        return (gateway.websocket(path, query: items), secrets.access.headers)
+        return (gateway.websocket(path, query: query, credential: credential), secrets.access.headers)
     }
 
     // MARK: Two addresses (#283)
@@ -443,9 +446,23 @@ public final class GatewayRuntime {
     /// now; the others re-attach once each, one at a time, after them, with no timer: at most one off-screen resume is in
     /// flight, and a trigger while they go runs them once more after.
     func reattachChats(all: Bool) {
+        // A reconnect drops every chat's model pick still waiting for the person's answer: its token may not hold.
+        if all { for chat in registry.all { chat.noteReconnected() } }
         for chat in registry.all where chat.isOnScreen {
             if all { if !attachIfFailed(chat) { chat.reattachNow() } } else if chat.needsReattach { chat.reattachNow() }
         }
+        runOffScreenPass(all: all)
+    }
+
+    /// The chats off screen that need it re-attached by the same pass, and no others: a replay gap's (`ChatSession`'s
+    /// `noteReplayGap`). One slow socket can end every chat's subscription at once; through the pass, at most one
+    /// off-screen resume is in flight however many came together.
+    func reattachOffScreen() {
+        runOffScreenPass(all: false)
+    }
+
+    /// The off-screen pass: one at a time, and a trigger while it runs runs it once more after.
+    private func runOffScreenPass(all: Bool) {
         if offScreenReattach != nil {
             offScreenAgain = true
             offScreenAgainAll = offScreenAgainAll || all

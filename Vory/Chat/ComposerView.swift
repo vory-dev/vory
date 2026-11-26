@@ -588,14 +588,14 @@ struct ComposerView: View {
         .onChange(of: photoItems) { _, items in chat.stagingBegan(); Task { await importPhotos(items); chat.stagingEnded() } }
         #if os(iOS)
         #if os(iOS)
-        .fullScreenCover(isPresented: $showCamera) { CameraPicker { data, name in chat.stageAttachment(data: data, name: name, kind: .image) }.ignoresSafeArea().withAppModel() }
+        .fullScreenCover(isPresented: $showCamera) { CameraPicker { data, name in chat.stageAttachment(data: data, name: name, kind: .image) }.ignoresSafeArea().withAppModel().modelConfirmationCover() }
         #endif
         #endif
         .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
             if case .success(let urls) = result { for u in urls { importFile(u) } }
         }
-        .sheet(isPresented: $showRecorder) { AudioRecorderSheet { url in importFile(url, kind: .audio) }.sheetFrame(.compact).withAppModel() }
-        .sheet(isPresented: $showHistory) { HistorySheet(history: chat.composerHistory) { text = $0 }.sheetFrame().withAppModel() }
+        .sheet(isPresented: $showRecorder) { AudioRecorderSheet { url in importFile(url, kind: .audio) }.sheetFrame(.compact).withAppModel().modelConfirmationCover() }
+        .sheet(isPresented: $showHistory) { HistorySheet(history: chat.composerHistory) { text = $0 }.sheetFrame().withAppModel().modelConfirmationCover() }
     }
 
     /// The field itself (its own view: the body's one expression grew past what the compiler
@@ -1117,7 +1117,7 @@ struct ComposerView: View {
             .accessibilityLabel("Context \(pct) percent used")
             .accessibilityShowsLargeContentViewer { Label("Context \(pct)%", systemImage: "circle.dashed") }
             .accessibilityIdentifier("composer.context")
-            .sheet(isPresented: $showContextSheet) { ContextBreakdownSheet(chat: chat).sheetFrame().withAppModel() }
+            .sheet(isPresented: $showContextSheet) { ContextBreakdownSheet(chat: chat).sheetFrame().withAppModel().modelConfirmationCover() }
         }
     }
 

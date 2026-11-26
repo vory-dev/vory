@@ -16,6 +16,8 @@ public enum ConnectProblem: Sendable, Equatable {
     case http(status: Int)
     /// Nothing came back in time.
     case noAnswer
+    /// The gateway is restarting: it answered 503 gateway_not_ready, or closed the socket 1013 (Hermes's own signs).
+    case restarting
 
     /// A few words, where the connection's state is shown.
     public var title: String {
@@ -25,6 +27,7 @@ public enum ConnectProblem: Sendable, Equatable {
         case .webPage: return "A web page answered, not the gateway"
         case .http(let status): return "The gateway answered HTTP \(status)"
         case .noAnswer: return "The gateway isn't answering"
+        case .restarting: return "The gateway is restarting"
         }
     }
 
@@ -41,6 +44,8 @@ public enum ConnectProblem: Sendable, Equatable {
             return "The gateway's address answered with HTTP \(status) instead of connecting. Vory keeps trying."
         case .noAnswer:
             return "Nothing came back from the gateway's address. Vory keeps trying, and tries again at once when the network changes."
+        case .restarting:
+            return "Vory reconnects when it's back."
         }
     }
 
@@ -64,13 +69,16 @@ public enum ConnectProblem: Sendable, Equatable {
                 if html || (300..<400).contains(status) || status == 200 { return .webPage(status: status) }
                 return .http(status: status)
             case .timeout: return .noAnswer
-            case .closed(let code, _): return code == 4401 || code == 4403 ? nil : .noAnswer
+            // 1013: a draining gateway closes its sockets with it (Hermes's restart).
+            case .closed(let code, _): return code == 4401 || code == 4403 ? nil : code == 1013 ? .restarting : .noAnswer
             case .notConnected, .cancelled: return nil
             }
         case let e as HermesAPIError:
             switch e {
             case .cloudflareAccess: return .cloudflareSignIn
             case .htmlResponse(let status): return (520...530).contains(status) ? .cloudflareOrigin(status: status) : .webPage(status: status)
+            // Hermes answers every request this way while it isn't ready: restarting, starting or draining.
+            case .http(503, "gateway_not_ready"): return .restarting
             case .http(let status, _): return .http(status: status)
             case .transport: return .noAnswer
             case .unauthorized, .sessionExpired, .decoding: return nil
@@ -84,5 +92,20 @@ public enum ConnectProblem: Sendable, Equatable {
         default:
             return nil
         }
+    }
+}
+
+extension ConnectProblem {
+    /// A refused session token. The gateway can't say why, so the words say what a Hermes update changes.
+    public static let sessionTokenRefused = "The gateway refused the session token. If Hermes was updated, it now uses a new one: on the gateway machine, run cat ~/.hermes/webapp/session-token (or look in webapp/ under Hermes's own home if it has one), and enter that token here."
+
+    /// A sign-in the gateway ended for good: its refresh was turned down.
+    public static let signInEnded = "The gateway ended this sign-in, so sign in again. A Hermes update can end every sign-in once."
+
+    /// The words shown for a sign-in the gateway refused, by the connection's sign-in mode.
+    public static func refusedWords(why: String, authMode: AuthMode, refreshRefused: Bool = false) -> String {
+        if authMode == .sessionToken { return sessionTokenRefused }
+        if refreshRefused { return signInEnded }
+        return why
     }
 }
