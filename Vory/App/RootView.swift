@@ -501,7 +501,11 @@ private struct RidesUnderChat: ViewModifier {
 }
 
 /// The mask itself: what stands to the leading side of `edge` (window space). A huge edge draws the whole capsule.
+/// The mask reaches `bleed` past the bar's layout frame above and below, always, and on both sides only for the huge
+/// edge: along the bottom the capsule and its circles hang past that frame into the home-indicator area
+/// (`VoryTabBar.overhang`), and a mask the frame's size cut them flat at its foot. A real edge keeps its exact cut.
 private struct EdgeMask: ViewModifier, Animatable {
+    static let bleed: CGFloat = 40
     var edge: CGFloat
     var animatableData: CGFloat {
         get { edge }
@@ -517,7 +521,10 @@ private struct EdgeMask: ViewModifier, Animatable {
                 // "<wall time> ride <minX> <edge> <shown width> <capsule width>" (StripRide66UITests reads it).
                 let _ = edge < 1e6 ? MorphFramesProbe.note("ride", CGRect(x: f.minX, y: edge, width: shown, height: f.width)) : ()
                 #endif
-                Rectangle().frame(width: shown, height: g.size.height)
+                let b = Self.bleed, whole = edge >= 1e6
+                Rectangle()
+                    .frame(width: whole ? g.size.width + 2 * b : shown, height: g.size.height + 2 * b)
+                    .offset(x: whole ? -b : 0, y: -b)
             }
         }
     }
