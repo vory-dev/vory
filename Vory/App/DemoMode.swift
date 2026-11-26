@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import VoryCore
 
 #if DEBUG
@@ -12,6 +13,8 @@ import VoryCore
 ///   -vory-demo-gateway <url> <session token> <name>   one saved gateway, connected at launch
 ///   -vory-demo-cloud <url> <session token> <name>     an iCloud backup to restore from, holding
 ///                                                     that gateway, a name and a few bot looks
+///   -vory-demo-keychain-locked                        every saved-gateway read refused, as on a phone
+///                                                     still locked after a restart
 ///   -vory-demo-biometry yes|no                        Face ID's answer, for the remembered
 ///                                                     sign-in (a simulator has no Face ID)
 /// None of this exists in a release build.
@@ -38,6 +41,9 @@ enum DemoMode {
     static func prepare() {
         guard isOn else { return }
         Keychain.memoryOnly = true
+        // `-vory-demo-keychain-locked`: every saved-gateway read answers as a phone still locked after a restart does,
+        // so the app opens on the screen that waits for the unlock (its accessibility audit).
+        if arguments.contains("-vory-demo-keychain-locked") { Keychain.forcedReadStatus = errSecInteractionNotAllowed }
         seedCloudGateway()
     }
 

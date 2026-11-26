@@ -370,6 +370,13 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// The tries' schedule, and the clock that moves the line to the banner.
     @ObservationIgnored private var reattachTimer: Task<Void, Never>?
     @ObservationIgnored private var showTimer: Task<Void, Never>?
+    /// The replay gaps' stretch (`GapPacing`): when its last gap came and how many it has had; the re-attach for one,
+    /// in flight or waiting its turn, and which run it is; and one more marked to follow it.
+    @ObservationIgnored private var lastGapAt: Date?
+    @ObservationIgnored private var gapStreak = 0
+    @ObservationIgnored private var gapReattach: Task<Void, Never>?
+    @ObservationIgnored private var gapRun = 0
+    @ObservationIgnored private var gapPending = false
     /// The socket went: no try of the chat's own until it's back, or Try again.
     @ObservationIgnored private var waitingForSocket = false
     /// How many of this chat's views are up (an iPad split or two Mac windows on one chat both hold it). A chat on
@@ -635,11 +642,13 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         reattachNow()
     }
 
-    /// The app went away: the tries and the clock stop.
+    /// The app went away: the tries and the clock stop, and a replay gap's re-attach with them (the runtime's own
+    /// re-attach on the way back covers it).
     func wentAwayForReattach() {
         reattachGeneration += 1
         reattachTimer?.cancel(); reattachTimer = nil
         showTimer?.cancel(); showTimer = nil
+        stopGapReattach()
     }
 
     /// The app came back: a chat still in trouble counts from now (a fresh minute of the quiet line before any banner),
@@ -679,6 +688,64 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             guard await self.waitOut(generation: g) else { return }
             await self.runTries(generation: g)
         }
+    }
+
+    /// A replay gap (`session.replay_gap`): the gateway ended this socket's subscription to the chat, its event backlog
+    /// having overflowed, and no more of the chat's events come until it attaches again. The socket itself is up. So the
+    /// chat attaches again as after a reconnect, on screen by itself and off screen by the runtime's pass
+    /// (`reattachForGap`), and the resume brings back its state, its subscription and the turn's later events. Paced by
+    /// `GapPacing`: never two at once for a chat, and a socket that keeps falling behind waits the reconnect schedule's
+    /// delays.
+    func noteReplayGap() {
+        guard !attachGone else { return }
+        let now = reattachClock.now()
+        let (decision, streak) = GapPacing.decision(lastGapAt: lastGapAt, streak: gapStreak, inFlight: gapReattach != nil, now: now)
+        lastGapAt = now
+        gapStreak = streak
+        switch decision {
+        case .afterTheOneInFlight: gapPending = true
+        case .now: startGapReattach(after: 0)
+        case .after(let wait): startGapReattach(after: wait)
+        }
+    }
+
+    private func startGapReattach(after wait: Double) {
+        gapRun += 1
+        let run = gapRun
+        gapReattach = Task { [weak self] in await self?.reattachForGap(run: run, after: wait) }
+    }
+
+    /// The gap's re-attach: its wait, spread by the schedule's jitter, then the re-attach. One marked meanwhile follows
+    /// it, after the schedule's wait for the stretch so far.
+    /// - On screen, the chat re-attaches itself, as after a reconnect.
+    /// - Off screen, it joins the runtime's off-screen pass instead (`GatewayRuntime.reattachOffScreen`), as a chat in
+    ///   trouble: one slow socket can end every chat's subscription at once, and the pass keeps it to one off-screen
+    ///   resume in flight across them all, as #641 does for a reconnect. Coming on screen first, it re-attaches then.
+    private func reattachForGap(run: Int, after wait: Double) async {
+        if wait > 0 {
+            let spread = wait * Double.random(in: (1 - ReattachSchedule.jitter)...(1 + ReattachSchedule.jitter))
+            do { try await reattachClock.sleep(spread) } catch { return }
+        }
+        guard run == gapRun, !Task.isCancelled else { return }
+        if isOnScreen {
+            await reattachAfterReconnect()
+        } else {
+            if troubleSince == nil { troubleSince = reattachClock.now(); updateShow() }
+            runtime.reattachOffScreen()
+        }
+        guard run == gapRun, !Task.isCancelled else { return }
+        gapReattach = nil
+        if gapPending {
+            gapPending = false
+            startGapReattach(after: ReattachSchedule.delay(afterFailures: max(1, gapStreak - 1)))
+        }
+    }
+
+    /// No replay gap's re-attach any more, in flight, waiting or marked: the chat closed, or the app went away.
+    private func stopGapReattach() {
+        gapRun += 1
+        gapReattach?.cancel(); gapReattach = nil
+        gapPending = false
     }
 
     private func runTries(generation g: Int) async {
@@ -1011,6 +1078,12 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// that appears while a snapshot is being made and is not one of these was added here (a
     /// message sent, its error): the snapshot was taken before it.
     private var fetchedRowIDs: Set<String> = []
+    /// On Hermes's session authority, the input ids this chat's own prompts were sent under, so its own entry in a
+    /// `session.info` pending list is never shown a second time (`showOthersPrompts`).
+    private var sentInputIDs: Set<String> = []
+    /// The admissions another client sent that this chat has shown, each with the id of its row. A transcript fetched
+    /// again puts the stored message in that row's place; the admission stays here, so it is never shown twice.
+    private var shownAdmissions: [String: String] = [:]
     /// Runs before each snapshot's rows are made, off the main actor; nil in the app. A test
     /// holds a build here to say what arrives while it runs.
     var beforeSnapshotRows: (@Sendable (JSONValue) async -> Void)?
@@ -1504,12 +1577,27 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         interruptCause = nil
         var outgoing = text
         var previews: [AttachmentPreview] = []
+        // Pictures Hermes's session authority staged for this turn: they go with the submit, not in its text.
+        var pictures: [StagedPicture] = []
+        let authority = runtime.sessionAuthority
         for a in staged {
+            // That authority takes at most ten pictures a message: the rest aren't sent, and each says so.
+            if authority, a.kind == .image, pictures.count >= Self.picturesPerMessage {
+                items.append(TranscriptItem(id: UUID().uuidString, kind: .error(text: Self.pictureLimitWords(name: a.name))))
+                continue
+            }
             do {
-                if let ref = try await upload(a) { outgoing += (outgoing.isEmpty ? "" : "\n") + ref }
+                switch try await upload(a, authority: authority) {
+                case .nothing: break
+                case .ref(let ref): outgoing += (outgoing.isEmpty ? "" : "\n") + ref
+                case .picture(let p): pictures.append(p)
+                }
                 previews.append(a)
             } catch {
-                items.append(TranscriptItem(id: UUID().uuidString, kind: .error(text: Self.attachmentFailure(name: a.name, kind: a.kind, error: error))))
+                // One the gateway refused says so here, in its own words: a PDF's file.attach on the authority as well. That
+                // PDF went as a file, so its row is a file's: the PDF tool's words are the legacy pdf.attach's.
+                let sentAs: AttachmentPreview.Kind = authority && a.kind == .pdf ? .file : a.kind
+                items.append(TranscriptItem(id: UUID().uuidString, kind: .error(text: Self.attachmentFailure(name: a.name, kind: sentAs, error: error))))
             }
         }
         staged = []
@@ -1525,7 +1613,11 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             // submission_id or input_id (gateway/session_controls.py submission()). The id is made once per turn, here: a
             // new message, a queued one sent, a spoken turn and Edit & resend each get their own. The legacy handler
             // refuses a key its contract doesn't declare, and declares neither, so that wire's submit stays as it was.
-            if runtime.sessionAuthority { params["input_id"] = .string(Self.newInputID()) }
+            // Kept, so this chat knows its own prompt when the authority lists it to every viewer (`showOthersPrompts`).
+            if runtime.sessionAuthority { let inputID = Self.newInputID(); sentInputIDs.insert(inputID); params["input_id"] = .string(inputID) }
+            // The staged pictures, exactly as the authority's admission takes them, and never an empty list. Only that
+            // wire stages one, so the legacy submit never carries the key.
+            if let attachments = Self.submitAttachments(pictures).param { params["attachments"] = attachments }
             let r = try await rpc("prompt.submit", params)
             lastSubmitStatus = r["status"]?.stringValue
             // A legacy gateway answers "queued" when the message waits behind a running turn. Hermes's session authority
@@ -1566,7 +1658,37 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         }
     }
 
-    private func upload(_ a: AttachmentPreview) async throws -> String? {
+    /// A picture Hermes's session authority has staged for the next turn (`image.attach_bytes`): the turn gets it only
+    /// through `prompt.submit`'s `attachments`, by the path and mime the gateway answered.
+    struct StagedPicture: Equatable, Sendable {
+        var path: String
+        var mime: String
+    }
+
+    /// Hermes's session authority admits at most ten pictures with one message (`_ATTACHMENT_LIMIT`), of these four
+    /// types (`_ATTACHMENT_MIMES`, the ones `image.attach_bytes` sniffs).
+    nonisolated static let picturesPerMessage = 10
+    nonisolated static let stagedPictureMimes: Set<String> = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+
+    /// The error row for a picture past that limit.
+    nonisolated static func pictureLimitWords(name: String) -> String {
+        "Attachment \(name) was not sent: a message takes at most \(picturesPerMessage) pictures."
+    }
+
+    /// `prompt.submit`'s `attachments` for a message's staged pictures: each exactly its path and mime, in order; nil
+    /// with none, since the gateway refuses an empty list. `over` is the indexes past the gateway's limit.
+    nonisolated static func submitAttachments(_ pictures: [StagedPicture]) -> (param: JSONValue?, over: [Int]) {
+        let sent = pictures.prefix(picturesPerMessage)
+        guard !sent.isEmpty else { return (nil, []) }
+        return (.array(sent.map { .object(["path": .string($0.path), "mime": .string($0.mime)]) }), Array(sent.count..<pictures.count))
+    }
+
+    /// What one upload leaves for its message: nothing more (the legacy wire keeps a picture or PDF in the session
+    /// itself), a reference to append to its text (a file, and a PDF on the session authority), or a picture the
+    /// authority staged for the turn.
+    private enum Uploaded { case nothing, ref(String), picture(StagedPicture) }
+
+    private func upload(_ a: AttachmentPreview, authority: Bool) async throws -> Uploaded {
         guard let url = a.localURL else { throw CocoaError(.fileNoSuchFile) }
         let kind = a.kind
         let name = a.name
@@ -1584,6 +1706,9 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             case .image:
                 return .imageOrPdf(b64: b64, filename: name, isImage: true)
             case .pdf:
+                // Hermes's session authority has no pdf.attach (it answers "session not found" there): a PDF goes as a
+                // file, by its own file.attach, and the agent reads it with its file tools.
+                if authority { return .file(dataUrl: "data:application/pdf;base64,\(b64)", filename: name) }
                 return .imageOrPdf(b64: b64, filename: name, isImage: false)
             case .audio, .video, .file:
                 let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
@@ -1594,11 +1719,18 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         switch payload {
         case .imageOrPdf(let b64, let filename, let isImage):
             let method = isImage ? "image.attach_bytes" : "pdf.attach"
-            _ = try await rpc(method, ["session_id": .string(runtimeID), "content_base64": .string(b64), "filename": .string(filename)])
-            return nil
+            let r = try await rpc(method, ["session_id": .string(runtimeID), "content_base64": .string(b64), "filename": .string(filename)])
+            // On the session authority attach_bytes only stages the picture, and answers its path with a mime; the turn
+            // gets it only through the submit's attachments. The legacy wire's answer has no mime: it queued the picture
+            // in the session, as before.
+            if isImage, authority, let path = r["path"]?.stringValue, !path.isEmpty,
+               let mime = r["mime"]?.stringValue, Self.stagedPictureMimes.contains(mime) {
+                return .picture(StagedPicture(path: path, mime: mime))
+            }
+            return .nothing
         case .file(let dataUrl, let filename):
             let r = try await rpc("file.attach", ["session_id": .string(runtimeID), "data_url": .string(dataUrl), "name": .string(filename)])
-            return r["ref_text"]?.stringValue
+            return r["ref_text"]?.stringValue.map(Uploaded.ref) ?? .nothing
         }
     }
 
@@ -1840,8 +1972,21 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// the session-scoped switch, then a line in the thread saying so (or what went wrong).
     public func switchModel(provider: String?, model: String) async {
         if isDraft { pendingModel = ModelPick(provider: provider, model: model); return }
-        do { try await setModel(provider: provider, model: model); systemLine("Model set to \(model)", symbol: "cpu") }
+        do {
+            try await setModel(provider: provider, model: model)
+            // The gateway asks first: the line waits for the person's answer and says what came of it.
+            if let asked = pendingModelConfirmation {
+                if await modelConfirmationAnswer(asked) { systemLine("Model set to \(asked.model)", symbol: "cpu") } else { noteModelKept() }
+                return
+            }
+            systemLine("Model set to \(model)", symbol: "cpu")
+        }
         catch { items.append(TranscriptItem(id: UUID().uuidString, kind: .error(text: "/model: \(error.localizedDescription)"))) }
+    }
+
+    /// A pick the gateway asked about wasn't used (cancelled, refused, or dropped): the thread says which model stays.
+    public func noteModelKept() {
+        systemLine("Model unchanged: \(modelName)", symbol: "cpu")
     }
 
     /// Slash commands, the way the terminal and the desktop run them: a few are the app's own
@@ -1960,12 +2105,128 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
 
     // MARK: Model / effort / fast / yolo (session-scoped)
 
+    /// A model pick the gateway asks the person to confirm before it applies.
+    public struct ModelConfirmation: Hashable, Sendable, Identifiable {
+        public var model: String
+        public var provider: String?
+        public var message: String
+        /// Which offer this is, so an answer reaches only the offer it was shown for.
+        public var id = UUID()
+    }
+
+    /// The pick waiting for the person's answer, if any.
+    public private(set) var pendingModelConfirmation: ModelConfirmation?
+    /// What the pending pick sends once confirmed: the pick and the gateway's one-use token for it.
+    private var pendingModelPick: (provider: String?, model: String, token: String)?
+
+    /// How the last offer ended: its id, and whether the person's yes took it.
+    @ObservationIgnored private var lastModelConfirmationAnswer: (id: UUID, used: Bool)?
+    /// The send of the last yes from the alert, true once applied: what waits on the answer goes on after it.
+    @ObservationIgnored private var confirmedModelPick: Task<Bool, Never>?
+    /// Whatever waits on the pending offer's answer (`modelConfirmationAnswer`).
+    @ObservationIgnored private var modelConfirmationWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    /// The person said yes to the pending pick: it's sent with the gateway's token.
+    public func confirmModel() async throws {
+        guard let p = pendingModelPick else { return }
+        confirmedModelPick = nil
+        endModelConfirmation(used: true)
+        try await pickByMutation(provider: p.provider, model: p.model, confirm: p.token)
+    }
+
+    /// The alert's yes, for the offer it showed: taken at once if that offer is still the one waiting, so the alert
+    /// closes, then sent, with a refusal said in the banner. False, and nothing sent, when the offer no longer waits
+    /// (cancelled, dropped by a reconnect, or replaced by another pick).
+    @discardableResult public func acceptModelConfirmation(_ shown: ModelConfirmation) -> Bool {
+        guard pendingModelConfirmation?.id == shown.id, let p = pendingModelPick else { return false }
+        confirmedModelPick = Task { [weak self] in
+            do { try await self?.pickByMutation(provider: p.provider, model: p.model, confirm: p.token); return true }
+            catch { self?.banner = error.localizedDescription; return false }
+        }
+        endModelConfirmation(used: true)
+        return true
+    }
+
+    /// The person said no: nothing is applied or sent.
+    public func cancelModelConfirmation() { endModelConfirmation(used: false) }
+
+    /// The pending offer stops waiting: the alert closes, and whatever waits on its answer goes on.
+    private func endModelConfirmation(used: Bool) {
+        if let c = pendingModelConfirmation { lastModelConfirmationAnswer = (c.id, used) }
+        pendingModelConfirmation = nil
+        pendingModelPick = nil
+        let waiting = modelConfirmationWaiters.values
+        modelConfirmationWaiters = [:]
+        for w in waiting { w.resume() }
+    }
+
+    /// Waits for the person's answer to `asked`, the offer a pick came back with, and for a yes to be sent. True when
+    /// the yes was applied; false when the offer was cancelled, dropped (another pick, a reconnect, the chat's close),
+    /// its yes was refused, or the waiting task was cancelled, which leaves the offer waiting.
+    public func modelConfirmationAnswer(_ asked: ModelConfirmation) async -> Bool {
+        while pendingModelConfirmation?.id == asked.id, !Task.isCancelled {
+            let key = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                    if Task.isCancelled { c.resume() } else { modelConfirmationWaiters[key] = c }
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in self?.modelConfirmationWaiters.removeValue(forKey: key)?.resume() }
+            }
+        }
+        guard !Task.isCancelled, let a = lastModelConfirmationAnswer, a.id == asked.id, a.used else { return false }
+        return await confirmedModelPick?.value ?? true
+    }
+
+    /// A pending pick belongs to this chat as it was: a reconnect drops it, since its token may no longer hold.
+    func noteReconnected() { cancelModelConfirmation() }
+
+    /// The gateway asks before this pick applies: shown to the person, and kept with its token until they answer.
+    func offerModelConfirmation(_ c: ModelConfirmation, provider: String?, model: String, token: String) {
+        // One still waiting is over: what waits on it goes on, unanswered.
+        if pendingModelConfirmation != nil { endModelConfirmation(used: false) }
+        pendingModelConfirmation = c
+        pendingModelPick = (provider, model, token)
+    }
+
+    /// A model pick on a gateway whose session authority takes it only as a mutation (`session.mutate` operation
+    /// `model`, with the generation fence). Its answers: a confirmation to ask for, a pick deferred to the next turn,
+    /// or applied (the model line then follows the gateway's session.info).
+    private func pickByMutation(provider: String?, model: String, confirm: String?) async throws {
+        var payload: [String: JSONValue] = ["model": .string(model)]
+        if let provider, !provider.isEmpty { payload["provider"] = .string(provider) }
+        if let confirm { payload["confirm"] = .string(confirm) }
+        let r = try await mutate("model", payload, needsGeneration: true)
+        switch r["status"]?.stringValue {
+        case "confirmation_required":
+            guard let token = r["confirm"]?.stringValue, !token.isEmpty else { return }
+            let target = r["target_model"]?.stringValue ?? model
+            let message = r["confirm_message"]?.stringValue ?? "The gateway asks you to confirm this model before it's used."
+            offerModelConfirmation(ModelConfirmation(model: target, provider: r["target_provider"]?.stringValue ?? provider, message: message),
+                                   provider: provider, model: model, token: token)
+        case "deferred":
+            banner = "Model change applies at the next turn."
+        default:
+            break
+        }
+        await loadUsage()
+    }
+
     public func setModel(provider: String?, model: String) async throws {
         if isDraft { pendingModel = ModelPick(provider: provider, model: model); return }
+        // Another pick replaces one still waiting for the person's answer.
+        cancelModelConfirmation()
         var value = model
         if let provider, !provider.isEmpty { value += " --provider \(provider)" }
         value += " --session"
-        let r = try await rpc("config.set", ["key": "model", "value": .string(value), "session_id": .string(runtimeID)])
+        let r: JSONValue
+        do {
+            r = try await rpc("config.set", ["key": "model", "value": .string(value), "session_id": .string(runtimeID)])
+        } catch let e as RPCError where e.reason == "use_session_mutation_model" {
+            // A gateway whose session authority takes a model pick only as a mutation.
+            try await pickByMutation(provider: provider, model: model, confirm: nil)
+            return
+        }
         if r["confirm_required"]?.boolValue == true {
             _ = try await rpc("config.set", ["key": "model", "value": .string(value), "session_id": .string(runtimeID), "confirm_expensive_model": true])
         }
@@ -1985,7 +2246,15 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
 
     public func setYolo(_ on: Bool) async throws {
-        _ = try await rpc("config.set", ["key": "yolo", "value": .string(on ? "on" : "off"), "session_id": .string(runtimeID), "scope": "session"])
+        let value: JSONValue = .string(on ? "on" : "off")
+        do {
+            _ = try await rpc("config.set", ["key": "yolo", "value": value, "session_id": .string(runtimeID), "scope": "session"])
+        } catch let e as RPCError where runtime.sessionAuthority && e.reason == "invalid_params" {
+            // Hermes's session authority takes a scope here only as "global"; with none, the call reaches this session's
+            // own approval bypass. So the scope is left out only there, and never sent as "global": on the legacy wire a
+            // missing scope isn't known to be this session's.
+            _ = try await rpc("config.set", ["key": "yolo", "value": value, "session_id": .string(runtimeID)])
+        }
     }
 
     // MARK: Quick answers (voice)
@@ -2211,6 +2480,9 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// a late detach of an old subscription only answers `detached: false`. On the old wire, `session.close`, sent as
     /// before. Nobody waits on its answer.
     func close() async {
+        // A pick still waiting for the person's answer leaves with the chat, and so does a replay gap's re-attach.
+        cancelModelConfirmation()
+        stopGapReattach()
         if runtime.sessionAuthority {
             guard let subscriptionID else { return }
             _ = try? await rpc("session.detach", ["session_id": .string(runtimeID), "subscription_id": .string(subscriptionID),
@@ -2446,6 +2718,45 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
 
     // MARK: Events
 
+    /// What a failed turn says, from its message.complete: the transcript's row, and the turn's end for the
+    /// notification. Nil for a turn that didn't fail.
+    /// - The gateway's `error` when it sends one, as the legacy wire does.
+    /// - Else, for status "error" with no text of its own (Hermes's session authority sends no error string and an
+    ///   empty text): the words for its `failure_reason` code, which it sends only for some turns, else for its
+    ///   `error_surface` code, which it always sends; else plain words. A code is never shown as it is.
+    /// - A failed turn that left its own words (a compute host's "Error: ...") says nothing more, as before.
+    nonisolated static func turnFailure(_ p: JSONValue) -> String? {
+        if let e = p["error"]?.stringValue, !e.isEmpty { return e }
+        guard p["status"]?.stringValue == "error",
+              (p["text"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        for code in [p["failure_reason"]?.stringValue, p["error_surface"]?["code"]?.stringValue] {
+            if let code, let words = turnFailureWords[code.trimmingCharacters(in: .whitespacesAndNewlines)] { return words }
+        }
+        return "The turn failed."
+    }
+
+    /// Words for the codes a failed turn carries: `failure_reason`'s, as Hermes sets them (session_busy,
+    /// gateway_connection, content_policy_blocked), and the provider failure codes in `error_surface.code` that Hermes's
+    /// own clients have words for (tui_gateway/user_messages.py). Any other code says only that the turn failed.
+    nonisolated static let turnFailureWords: [String: String] = [
+        "session_busy": "Your bot is busy with another turn. Try again in a moment.",
+        "gateway_connection": "Couldn't reach your gateway.",
+        "content_policy_blocked": "The model declined this request.",
+        "auth": "The model provider rejected the API key.",
+        "auth_permanent": "The model provider rejected the API key.",
+        "billing": "The model provider reports no credit left.",
+        "billing_unverified": "The model provider reports no credit left.",
+        "rate_limit": "The model provider is limiting requests. Try again in a moment.",
+        "upstream_rate_limit": "The model provider is limiting requests. Try again in a moment.",
+        "overloaded": "The model provider is overloaded. Try again in a moment.",
+        "server_error": "The model provider had an internal error. Try again in a moment.",
+        "timeout": "The model provider didn't answer in time.",
+        "context_overflow": "This chat is too long for the model.",
+        "payload_too_large": "This request is too large for the model.",
+        "model_not_found": "The model provider doesn't offer this model.",
+        "local_runtime_unavailable": "The local model server isn't running.",
+    ]
+
     public func handle(event ev: GatewayEvent) {
         // A snapshot is being made: this comes after it (see `apply(snapshot:)`).
         if snapshotsBuilding > 0 { heldEvents.append((ev, Date())); return }
@@ -2501,7 +2812,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             }
             turnStartedAt = nil
             let status = p["status"]?.stringValue
-            if let err = p["error"]?.stringValue, !err.isEmpty { appendError(err) }
+            if let err = Self.turnFailure(p) { appendError(err) }
             // The gateway's own "Operation interrupted." message is shown as a card that says as much.
             else if status == "interrupted", InterruptedTurn.parse(text ?? "") == nil { items.append(TranscriptItem(id: UUID().uuidString, kind: .system(text: "Interrupted", symbol: "stop.circle"))) }
             if let w = p["warning"]?.stringValue, !w.isEmpty { banner = w }
@@ -2513,7 +2824,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             statusLine = nil
             activityEndTask?.cancel(); activityEndTask = nil
             activity.end(for: self, phase: finalPhase)
-            runtime.cardNotifier?.turnFinished(chat: self, error: p["error"]?.stringValue)
+            runtime.cardNotifier?.turnFinished(chat: self, error: Self.turnFailure(p))
             saveTranscriptCache()
             drainQueue()
         case "session.usage":
@@ -2525,7 +2836,20 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
                 info = runtime.sessionAuthority ? SessionLiveInfo.merging(info, i) : i
                 if let t = i.title, !t.isEmpty { title = t }; if let r = i.running { isRunning = r }
             }
-            if runtime.sessionAuthority { noteGeneration(p["execution_generation"]?.intValue); noteRevision(p["revision"]?.intValue) }
+            if runtime.sessionAuthority {
+                noteGeneration(p["execution_generation"]?.intValue); noteRevision(p["revision"]?.intValue)
+                showOthersPrompts(p["pending"]?.arrayValue ?? [])
+            }
+        case "session.updated":
+            // Hermes's session authority's receipt for an applied edit, sent to the chat's viewers: its fences, and a
+            // rename's title as the gateway stored it. Its other fields aren't read.
+            guard runtime.sessionAuthority else { break }
+            noteGeneration(p["execution_generation"]?.intValue)
+            noteRevision(p["revision"]?.intValue)
+            if let t = p["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty { title = t }
+        case "session.replay_gap":
+            // This socket's subscription to the chat ended (its backlog overflowed); the socket itself is up.
+            noteReplayGap()
         case "session.title":
             if let t = p["title"]?.stringValue { title = t }
         case "status.update":
@@ -2643,7 +2967,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
                 activityEndTask?.cancel(); activityEndTask = nil
                 activity.end(for: self, phase: (p["status"]?.stringValue == "error" || p["error"]?.stringValue?.isEmpty == false) ? "error" : "done")
             }
-            runtime.cardNotifier?.turnFinished(chat: self, error: p["error"]?.stringValue)
+            runtime.cardNotifier?.turnFinished(chat: self, error: Self.turnFailure(p))
             drainQueue()
         case "error":
             if !isRunning {
@@ -2698,6 +3022,31 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     private func appendError(_ text: String) {
         if let last = items.last, case .error(let t) = last.kind, t == text { return }
         items.append(TranscriptItem(id: UUID().uuidString, kind: .error(text: text)))
+    }
+
+    /// Hermes's session authority lists a session's pending admissions to every viewer in `session.info`, each with its
+    /// public `text` and the `input_id` its sender named it by; the claim's `message.start` carries nothing of a person's
+    /// prompt. So a prompt another client sent shows here only from that list: once its entry reads `started`, as an
+    /// ordinary user row, one per admission, never this chat's own, in front of the reply its claim began. A prompt this
+    /// chat already shows for the turn (a snapshot's inflight one: the last user row, with no finished reply after it)
+    /// is taken as the admission's row. Queued entries wait for their claim, and a steering one (a queued admission in
+    /// transfer to the running turn, which reads `started` too) is never shown: it is a steer, not a turn's prompt.
+    private func showOthersPrompts(_ pending: [JSONValue]) {
+        for entry in pending {
+            guard entry["status"]?.stringValue == "started", entry["steering"]?.boolValue != true,
+                  let admission = entry["admission_id"]?.stringValue, !admission.isEmpty,
+                  shownAdmissions[admission] == nil, let text = entry["text"]?.stringValue, !text.isEmpty else { continue }
+            if let input = entry["input_id"]?.stringValue, sentInputIDs.contains(input) { continue }
+            if let last = items.lastIndex(where: { if case .user = $0.kind { return true }; return false }),
+               case .user(let shownText, _) = items[last].kind, shownText == text,
+               !items[(last + 1)...].contains(where: { if case .assistant(let t, _, let streaming) = $0.kind { return !streaming && !t.isEmpty }; return false }) {
+                shownAdmissions[admission] = items[last].id
+                continue
+            }
+            let row = TranscriptItem(id: "pending-user-\(admission)", kind: .user(text: text, attachments: []))
+            shownAdmissions[admission] = row.id
+            if let s = streamingItemID, let i = items.firstIndex(where: { $0.id == s }) { items.insert(row, at: i) } else { items.append(row) }
+        }
     }
 
     private func beginStreaming() {

@@ -24,7 +24,12 @@ struct MacRootView: View {
 
     var body: some View {
         ZStack {
-            if model.hasConnections && !Self.forceWelcome {
+            if model.store.isUnreadable {
+                // The saved gateways can't be read yet. Not the first screen, whose first gateway would be saved over them.
+                ContentUnavailableView("Waiting for the Keychain", systemImage: "lock",
+                                       description: Text("Vory reads your saved gateways once this Mac's Keychain can be read."))
+                    .frame(minWidth: 520, minHeight: 680)
+            } else if model.hasConnections && !Self.forceWelcome {
                 MainSplitView()
             } else {
                 OnboardingView()
@@ -509,7 +514,8 @@ private struct GatewayFooter: View {
         guard let s = model.runtime?.socketState else { return .secondary }
         switch s {
         case .open: return .green
-        case .connecting, .reconnecting, .idle: return .orange
+        // A restart reads as reconnecting: the gateway is coming back.
+        case .connecting, .reconnecting, .idle, .unreachable(.restarting, _): return .orange
         case .authRejected, .failed, .unreachable: return .red
         }
     }

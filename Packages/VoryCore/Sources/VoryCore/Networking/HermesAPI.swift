@@ -17,6 +17,8 @@ public enum HermesAPIError: LocalizedError, Sendable {
             return "This URL is not the Hermes dashboard API (got an HTML login/page). Use the `hermes serve` / dashboard URL, add Access service-token headers if Cloudflare Access is on, and confirm the tunnel upgrades WebSockets."
         case .cloudflareAccess:
             return "Cloudflare Access asked for a sign-in in a browser, which Vory can't do. Check the tunnel's Access settings, or add an Access service token to this gateway in Vory."
+        // A restart that outlasted the call's waits (`HermesAPI.answered`).
+        case .http(503, "gateway_not_ready"): return "The gateway is restarting. Try again in a moment."
         case .http(let status, let detail): return detail.isEmpty ? "HTTP \(status)" : "\(detail) (HTTP \(status))"
         case .unauthorized(let d): return d.isEmpty ? "The gateway rejected the credentials (401)." : d
         case .decoding(let m): return "Unexpected response from the gateway: \(m)"
@@ -124,10 +126,10 @@ public actor HermesAPI {
     }
 
     /// `directOnly`: never through a relay (the socket's ticket: one minted by the phone is no
-    /// use to a watch whose own route to the gateway is down).
-    public func send<T: Decodable, B: Encodable & Sendable>(_ method: String, _ path: String, query: [URLQueryItem] = [], profile: String? = nil, body: B, directOnly: Bool = false) async throws -> T {
+    /// use to a watch whose own route to the gateway is down). `waitsOutRestart`: see `answered`.
+    public func send<T: Decodable, B: Encodable & Sendable>(_ method: String, _ path: String, query: [URLQueryItem] = [], profile: String? = nil, body: B, directOnly: Bool = false, waitsOutRestart: Bool = true) async throws -> T {
         let encoded = try JSONEncoder().encode(body)
-        let (data, _) = try await raw(method, path, query: query, profile: profile, body: (encoded, "application/json"), authenticated: true, directOnly: directOnly)
+        let (data, _) = try await raw(method, path, query: query, profile: profile, body: (encoded, "application/json"), authenticated: true, directOnly: directOnly, waitsOutRestart: waitsOutRestart)
         return try decode(data)
     }
 
@@ -172,12 +174,12 @@ public actor HermesAPI {
 
     // MARK: Core
 
-    public func raw(_ method: String, _ path: String, query: [URLQueryItem] = [], profile: String? = nil, body: (Data, String)?, authenticated: Bool, directOnly: Bool = false) async throws -> (Data, HTTPURLResponse) {
+    public func raw(_ method: String, _ path: String, query: [URLQueryItem] = [], profile: String? = nil, body: (Data, String)?, authenticated: Bool, directOnly: Bool = false, waitsOutRestart: Bool = true) async throws -> (Data, HTTPURLResponse) {
         var items = query
         if let profile, !profile.isEmpty, !items.contains(where: { $0.name == "profile" }) {
             items.append(URLQueryItem(name: "profile", value: profile))
         }
-        let (data, http, refreshed) = try await answered(method, path, items: items, body: body, authenticated: authenticated, directOnly: directOnly)
+        let (data, http, refreshed) = try await answered(method, path, items: items, body: body, authenticated: authenticated, directOnly: directOnly, waitsOutRestart: waitsOutRestart)
         if http.statusCode >= 400 { throw Self.error(for: http, data: data) }
         // The retry after a renewal is judged by its status alone, as before.
         if !refreshed, Self.looksLikeHTML(http: http, data: data) { throw Self.htmlError(http) }
@@ -206,10 +208,45 @@ public actor HermesAPI {
         return RelayedResponse(status: http.statusCode, contentType: http.value(forHTTPHeaderField: "Content-Type"), body: data)
     }
 
+    /// A call as `answeredOnce` makes it, tried again while the gateway answers that it's restarting (503
+    /// gateway_not_ready, which it answers before the app sees the call: nothing ran, so any method is safe to try
+    /// again), after each of `restartWaits`. `waitsOutRestart` false: the answer as it comes (the socket's own ticket,
+    /// whose loop retries by itself).
+    private func answered(_ method: String, _ path: String, items: [URLQueryItem], body: (Data, String)?, authenticated: Bool, directOnly: Bool = false, waitsOutRestart: Bool = true) async throws -> (Data, HTTPURLResponse, refreshed: Bool) {
+        var waits = waitsOutRestart ? Self.restartWaits(budget: Self.restartBudget) : []
+        while true {
+            let answer = try await answeredOnce(method, path, items: items, body: body, authenticated: authenticated, directOnly: directOnly)
+            guard !waits.isEmpty, Self.isNotReady(answer.1, answer.0), !Task.isCancelled else { return answer }
+            try? await Task.sleep(for: .seconds(waits.removeFirst()))
+            // Cancelled during the wait: the 503 as it came, and no call after the cancel.
+            if Task.isCancelled { return answer }
+        }
+    }
+
+    /// How long a call waits out a restart, in all.
+    public static let restartBudget: Double = 20
+
+    /// The waits between tries of a call the gateway answered 503 gateway_not_ready, within `budget` seconds: 1, 2, 3,
+    /// 5 and 8, as many as fit.
+    public nonisolated static func restartWaits(budget: Double) -> [Double] {
+        var waits: [Double] = [], total = 0.0
+        for w in [1.0, 2, 3, 5, 8] where total + w <= budget {
+            waits.append(w)
+            total += w
+        }
+        return waits
+    }
+
+    /// Whether the gateway answered that it isn't ready: restarting, starting or draining.
+    nonisolated static func isNotReady(_ http: HTTPURLResponse, _ data: Data) -> Bool {
+        guard http.statusCode == 503, let obj = try? JSONDecoder().decode(JSONValue.self, from: data) else { return false }
+        return obj["error"]?.stringValue == "gateway_not_ready"
+    }
+
     /// One call and, on a 401 for a bearer sign-in, one renewal and a retry. Not after a
     /// relayed 401: the relay renewed its own sign-in already, and the watch has nothing to
     /// renew with. `refreshed`: the answer is the retry's.
-    private func answered(_ method: String, _ path: String, items: [URLQueryItem], body: (Data, String)?, authenticated: Bool, directOnly: Bool = false) async throws -> (Data, HTTPURLResponse, refreshed: Bool) {
+    private func answeredOnce(_ method: String, _ path: String, items: [URLQueryItem], body: (Data, String)?, authenticated: Bool, directOnly: Bool = false) async throws -> (Data, HTTPURLResponse, refreshed: Bool) {
         let (data, http, relayed) = try await perform(method, path, items: items, body: body, authenticated: authenticated, directOnly: directOnly)
         if http.statusCode == 401, !relayed, authenticated, signer.authMode.usesBearer, let refresher {
             let refreshed = try await coalescedRefresh(refresher)

@@ -166,7 +166,7 @@ struct ConversationView: View {
                     .navigationTitle(pageShown ? chat.title : model.selectedTab.title)
                     .toolbar(.hidden, for: .navigationBar)
                     #endif
-                    .sheet(isPresented: $showContext) { ContextBreakdownSheet(chat: chat).sheetFrame().withAppModel() }
+                    .sheet(isPresented: $showContext) { ContextBreakdownSheet(chat: chat).sheetFrame().withAppModel().modelConfirmationCover() }
                     // "All Models…" from a model menu for this chat (#401); the bot card opens it itself while it is up.
                     .onChange(of: model.modelChooser?.id) { _, _ in
                         guard let r = model.modelChooser, r.chat === chat, !showProfile else { return }
@@ -207,7 +207,7 @@ struct ConversationView: View {
                     .sheet(isPresented: $showProfile) { ProfileInfoSheet(chat: chat, profileName: chat.profileName).sheetFrame().withAppModel() }
                     .onChange(of: showProfile) { _, _ in Smooth.animate("botCard") }
                     .onChange(of: chat.isRunning, initial: true) { _, running in if running { Smooth.begin("turn") } else { Smooth.end("turn") } }
-                    .sheet(isPresented: $renaming) { RenameChatSheet(chat: chat).sheetFrame(.compact).withAppModel() }
+                    .sheet(isPresented: $renaming) { RenameChatSheet(chat: chat).sheetFrame(.compact).withAppModel().modelConfirmationCover() }
                     .alert("Replace your draft?", isPresented: Binding(get: { replacingDraft != nil }, set: { if !$0 { replacingDraft = nil } }),
                            presenting: replacingDraft) { r in
                         Button("Replace", role: .destructive) { takeIntoComposer(r.text, r.id) }
@@ -215,6 +215,10 @@ struct ConversationView: View {
                     } message: { _ in
                         Text("The words you've typed will be replaced with the message.")
                     }
+                    // A model pick the gateway asks the person to confirm, from the composer's chip or "/model", the
+                    // More menu, or this chat's first pick: asked here while no sheet is over the chat
+                    // (`ModelConfirmationHosts`); a sheet that picks asks over itself.
+                    .modelConfirmationHost(chat, in: .page)
                     // A tapped "@bot" opens that bot's card; every other link goes its usual way.
                     .environment(\.openURL, OpenURLAction { url in
                         if let b = Mentions.bot(from: url) { mentionedBot = b; return .handled }
@@ -373,7 +377,7 @@ struct ConversationView: View {
             }
             .fullScreenCover(isPresented: Binding(get: { HandsFreeSession.shared.isActive(for: chat) && !HandsFreeSession.shared.minimized },
                                                    set: { if !$0, HandsFreeSession.shared.isActive(for: chat) { HandsFreeSession.shared.minimized = true } })) {
-                HandsFreeView(chat: chat).withAppModel()
+                HandsFreeView(chat: chat).withAppModel().modelConfirmationCover()
             }
         #endif
     }
@@ -427,6 +431,15 @@ struct ConversationView: View {
                 chat = fresh
             }
             if let chat, composerText.isEmpty, let draft = ComposerDrafts.load(for: chat) { composerText = draft }
+            // The compose sheet's model, when the gateway asks before it applies: the chat shows with the question, and
+            // its voice mode and first message wait for the answer, so they run on the model the person chose (#27).
+            // After Cancel, or a question dropped, they go on the chat's model, and the thread says so. Left before an
+            // answer (this task is cancelled), nothing goes, and the next open asks again.
+            if let chat, route.initialModel != nil, !sentInitial, let asked = chat.pendingModelConfirmation {
+                let used = await chat.modelConfirmationAnswer(asked)
+                if Task.isCancelled { return }
+                if !used { chat.noteModelKept() }
+            }
             #if DEBUG
             // For a UI test: `-vory-test-stage <name>.pdf` stages a small PDF of that name in
             // the chat as it opens, where the system file picker cannot be driven.

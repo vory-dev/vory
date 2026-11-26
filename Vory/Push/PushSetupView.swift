@@ -16,6 +16,10 @@ struct PushSetupView: View {
     @State private var showCompanionSignIn = false
     @State private var confirmStartOver = false
     @State private var confirmQuit = false
+    #if DEBUG
+    /// `-vory-setup-signin` was read: the wizard opened on the sign-in step once, and a later appearance leaves it be.
+    @State private var openedOnSignIn = false
+    #endif
 
     private var rt: GatewayRuntime? { model.runtime }
 
@@ -140,6 +144,10 @@ struct PushSetupView: View {
             Text("Clears the address, the companion sign-in and \(DeviceWords.this)'s progress. Nothing on the gateway changes until you install again.")
         }
         .task {
+            #if DEBUG
+            // `-vory-setup-signin`: open on the sign-in step, so its row can be looked at without the first step's push setup.
+            if !openedOnSignIn, ProcessInfo.processInfo.arguments.contains("-vory-setup-signin") { openedOnSignIn = true; step = .signIn }
+            #endif
             if setup.teamID.isEmpty { setup.teamID = ProvisioningProfile.teamID ?? "" }
             guard let rt else { return }
             await setup.prepare(runtime: rt)
@@ -364,7 +372,13 @@ struct PushSetupView: View {
                 Text("This gateway has its auth gate on, so the session token is refused. The companion gets its own sign-in — separate from \(DeviceWords.this)'s — and refreshes it itself.")
                     .font(.footnote).foregroundStyle(.secondary)
             case .ready(let provider):
-                Label("Signed in\(provider.map { " via \($0)" } ?? "")\(setup.companionSecrets?.userId.map { " as \($0)" } ?? "")", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                if PushSetupModel.companionSignInRefused(setup.heartbeat, now: Date()) {
+                    Label { Text("The gateway turned down the companion's sign-in") } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                    Text("Sign in again, then install, so the companion gets the new sign-in. A Hermes update can end every sign-in once.")
+                        .font(.footnote)
+                } else {
+                    Label { Text("Signed in\(provider.map { " via \($0)" } ?? "")\(setup.companionSecrets?.userId.map { " as \($0)" } ?? "")") } icon: { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+                }
                 Button { showCompanionSignIn = true } label: { Label("Sign in again", systemImage: "person.badge.key") }
                 Button(role: .destructive) { withAnimation(.snappy) { setup.signOutCompanion(runtime: rt) } } label: { Label("Sign out the companion", systemImage: "person.slash") }
             }
@@ -1292,6 +1306,15 @@ final class PushSetupModel {
     var companionHealthy: Bool {
         guard let hb = heartbeat, hb.connected == true, !runningOlderCode, installedScriptMatches else { return false }
         return Date().timeIntervalSince(Date(timeIntervalSince1970: hb.updatedAt)) <= Self.heartbeatSeconds * 6
+    }
+    /// Whether the companion's own heartbeat says the gateway turned down its sign-in (#764): the heartbeat is
+    /// fresh, the companion isn't connected, and its error holds the companion's own words for it. A stale
+    /// heartbeat, none, or any other error leaves the row as it was: at worst a "Signed in" that's out of date,
+    /// never a wrong "turned down".
+    static func companionSignInRefused(_ heartbeat: CompanionHeartbeat?, now: Date) -> Bool {
+        // The companion's words, from server/hermes-push/hermes_push.py; its own tests pin them too.
+        guard let hb = heartbeat, hb.connected == false, let error = hb.error, error.contains("sign-in rejected") else { return false }
+        return now.timeIntervalSince(Date(timeIntervalSince1970: hb.updatedAt)) <= heartbeatSeconds * 6
     }
 
     func appleReady(push: PushRegistrar) -> Bool {

@@ -11,18 +11,36 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import json
 import logging
 import os
+import secrets
 import sys
 import tempfile
+import time
 import types
 import unittest
+import urllib.error
+import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 os.environ.setdefault("HERMES_PUSH_GATEWAY_URL", "http://127.0.0.1:9")
+
+
+def _use_home(home: Path) -> None:
+    """Hermes's home, the push folder and the companion's conf, all in `home`."""
+    os.environ["HERMES_HOME"] = str(home)
+    os.environ["HERMES_PUSH_DEVICES_DIR"] = str(home / "push" / "devices")
+    os.environ["HERMES_PUSH_CONFIG"] = str(home / "push" / "hermes-push.conf")
+
+
+# Every test runs in a home of its own, never this account's: run with `env -i`, HOME is unset and Path.home() would
+# name this account's folder. The module's home is this one; the tests of a migrated gateway make one each (OwnHome).
+_MODULE_HOME = tempfile.TemporaryDirectory(prefix="companion-test-home-")
+_use_home(Path(_MODULE_HOME.name))
 if "jwt" not in sys.modules:
     try:
         import jwt  # noqa: F401
@@ -464,3 +482,414 @@ class SealedLiveActivityTests(unittest.TestCase):
 
 #: The vector in the app's PushRelayCryptoTests.decryptsCompanionVector (VoryTests/HermesRemoteTests.swift).
 APP_VECTOR = "AAAAAAAAAAAAAAAAtYU0VDkMDkw9bK26mN+/eh0EeugNhF4ctNCQrAgnBvQ6vurB94SMNXCYlKJV"
+
+
+# -- a gateway after Hermes's update --------------------------------------------------------
+
+
+def webapp_token() -> str:
+    """A token of the Webapp's form, made by the test: 43 characters of A-Za-z0-9_-."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+    return "".join(secrets.choice(alphabet) for _ in range(43))
+
+
+class Answer:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.status = 200
+    def read(self) -> bytes: return self.body
+    def __enter__(self): return self
+    def __exit__(self, *a) -> None: return None
+
+
+class Rest:
+    """urllib.request.urlopen stood in for, so nothing leaves the machine: each request answered as `answer(req)` says,
+    (status, body), and its session token kept."""
+
+    def __init__(self, test: unittest.TestCase, answer) -> None:
+        import urllib.request
+        self.tokens: list[str | None] = []
+        real = urllib.request.urlopen
+
+        def urlopen(req, timeout=None):
+            self.tokens.append(req.get_header("X-hermes-session-token"))
+            status, body = answer(req)
+            if status >= 400:
+                raise urllib.error.HTTPError(req.full_url, status, "Unauthorized" if status == 401 else "Error", {}, io.BytesIO(body))
+            return Answer(body)
+
+        urllib.request.urlopen = urlopen
+        test.addCleanup(setattr, urllib.request, "urlopen", real)
+
+
+def takes(token: str):
+    """A REST answer that takes one session token: 200, else 401 as Hermes after its update answers."""
+    return lambda req: (200, b'{"ok": true}') if req.get_header("X-hermes-session-token") == token else (401, b'{"detail": "Unauthorized"}')
+
+
+class TokenGateway:
+    """A local socket gateway that takes one session token, if it's given one: any other is accepted, then closed 4401,
+    as Hermes after its update does. Every upgrade's token is kept, as the gateway decodes it."""
+
+    def __init__(self, accepts: str | None) -> None:
+        self.accepts = accepts
+        self.tokens: list[str] = []
+
+    async def handler(self, ws) -> None:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(ws.request.path).query)
+        token = (query.get("token") or [""])[0]
+        self.tokens.append(token)
+        if self.accepts is not None and token != self.accepts:
+            await ws.close(4401, "unauthorized")
+            return
+        await FakeGateway("ok").handler(ws)
+
+
+class OwnHome:
+    """A home of the test's own: Hermes's home, the push folder and the conf, the conf as the test writes it."""
+
+    def own_home(self, conf: dict[str, str]) -> Path:
+        d = tempfile.TemporaryDirectory(prefix="companion-test-home-")
+        self.addCleanup(d.cleanup)
+        keys = ("HERMES_HOME", "HERMES_PUSH_DEVICES_DIR", "HERMES_PUSH_CONFIG", "HERMES_PUSH_GATEWAY_URL")
+        saved = {k: os.environ.get(k) for k in keys}
+
+        def restore() -> None:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            hermes_push._CONF.clear()
+            hermes_push._CONF_PATH = None
+            hermes_push._load_conf()
+
+        self.addCleanup(restore)
+        home = Path(d.name)
+        _use_home(home)
+        os.environ.pop("HERMES_PUSH_GATEWAY_URL", None)   # the conf names it
+        (home / "push").mkdir(parents=True)
+        (home / "push" / "hermes-push.conf").write_text("".join(f"{k}={v}\n" for k, v in conf.items()), encoding="utf-8")
+        hermes_push._CONF.clear()
+        hermes_push._CONF_PATH = None
+        hermes_push._load_conf()
+        return home
+
+    @staticmethod
+    def write_webapp_token(home: Path, token: str, mode: int = 0o600) -> Path:
+        folder = home / "webapp"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        path = folder / "session-token"
+        path.write_text(token + "\n", encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def count_reads(self, path: Path) -> list[int]:
+        """How often `path` is read, by any version of the companion."""
+        reads = [0]
+        real = Path.read_text
+
+        def read_text(p, *a, **k):
+            if Path(p) == path:
+                reads[0] += 1
+            return real(p, *a, **k)
+
+        Path.read_text = read_text
+        self.addCleanup(setattr, Path, "read_text", real)
+        return reads
+
+
+class MigratedGatewayTests(OwnHome, unittest.IsolatedAsyncioTestCase):
+    """A gateway after Hermes's update: its Webapp's session token in place of the companion's, error text with no
+    credential in it, a token that arrives whole, approvals and questions as events, a failed turn's words, the title
+    from session.info, and new code taken while cut off."""
+
+    async def serve(self, accepts: str | None):
+        fake = TokenGateway(accepts)
+        server = await websockets.serve(fake.handler, "127.0.0.1", 0)
+
+        async def stop() -> None:
+            server.close()
+            await server.wait_closed()
+
+        self.addAsyncCleanup(stop)
+        return server.sockets[0].getsockname()[1], fake
+
+    def gateway(self):
+        gw = hermes_push.Gateway()
+        self.addAsyncCleanup(gw.close)
+        return gw
+
+    @staticmethod
+    async def connected(gw):
+        """A connect, with a bound: an older companion can wait a call's whole minute on a socket closed under it."""
+        await asyncio.wait_for(gw.connect(), timeout=10)
+        return gw
+
+    # 1
+    async def test_a_refused_session_token_uses_the_webapp_one(self) -> None:
+        webapp = webapp_token()
+        port, fake = await self.serve(accepts=webapp)
+        home = self.own_home({"HERMES_PUSH_GATEWAY_URL": f"http://127.0.0.1:{port}", "HERMES_PUSH_GATEWAY_TOKEN": "configured-token"})
+        self.write_webapp_token(home, webapp)
+        rest = Rest(self, takes(webapp))
+        # REST: the configured token, refused; the Webapp's, once refused; then the Webapp's straight away.
+        gw = self.gateway()
+        self.assertEqual(gw._http("GET", "/api/status"), {"ok": True})
+        self.assertEqual(gw._http("GET", "/api/status"), {"ok": True})
+        self.assertEqual(rest.tokens, ["configured-token", webapp, webapp])
+        # The socket: the configured token closed 4401, then the Webapp's taken, in the one connect.
+        sock = self.gateway()
+        await self.connected(sock)
+        self.assertEqual(fake.tokens, ["configured-token", webapp])
+        self.assertEqual(await sock.call("session.list"), {})
+        self.assertTrue(sock.transport.endswith("(Webapp session token)"), sock.transport)
+
+    # 2
+    async def test_the_webapp_token_is_never_written_or_logged(self) -> None:
+        webapp = webapp_token()
+        port, _ = await self.serve(accepts=webapp)
+        home = self.own_home({"HERMES_PUSH_GATEWAY_URL": f"http://127.0.0.1:{port}", "HERMES_PUSH_GATEWAY_TOKEN": "configured-token"})
+        path = self.write_webapp_token(home, webapp)
+        conf = (home / "push" / "hermes-push.conf").read_bytes()
+        gw = self.gateway()
+        with self.assertLogs("hermes-push", level="DEBUG") as logs:
+            await self.connected(gw)
+        hermes_push.write_status(transport=gw.transport)
+        status = hermes_push.status_path().read_text(encoding="utf-8")
+        self.assertEqual((home / "push" / "hermes-push.conf").read_bytes(), conf, "the conf was written")
+        self.assertNotIn(webapp, "\n".join(logs.output))
+        self.assertIn(str(path), "\n".join(logs.output), "the log doesn't name the file")
+        self.assertNotIn(webapp, status)
+        self.assertIn("Webapp session token", status)
+        self.assertNotIn(webapp, json.dumps(gw.headers))
+
+    # 3
+    async def test_an_unusable_token_file_says_what_to_do(self) -> None:
+        for case in ("missing", "unreadable", "malformed", "not UTF-8"):
+            with self.subTest(case=case):
+                port, _ = await self.serve(accepts=webapp_token())
+                home = self.own_home({"HERMES_PUSH_GATEWAY_URL": f"http://127.0.0.1:{port}", "HERMES_PUSH_GATEWAY_TOKEN": "configured-token"})
+                if case == "unreadable":
+                    self.write_webapp_token(home, webapp_token(), mode=0o000)
+                elif case == "malformed":
+                    self.write_webapp_token(home, "too-short")
+                elif case == "not UTF-8":
+                    # A token's length, but bytes no UTF-8 reader takes: the words, never the codec's message.
+                    self.write_webapp_token(home, "").write_bytes(b"\xff\xfe" + b"A" * 41)
+                Rest(self, takes("nothing"))
+                with self.assertRaises(RuntimeError) as rest:
+                    self.gateway()._http("GET", "/api/status")
+                self.assertIn("set the companion up again", str(rest.exception))
+                with self.assertRaises(ConnectionError) as sock:
+                    await self.connected(self.gateway())
+                self.assertIn("set the companion up again", str(sock.exception))
+
+    # 4
+    async def test_error_text_carries_no_credential(self) -> None:
+        # The broken address: a fragment in the URL makes the socket's address invalid, and the error names it whole.
+        self.own_home({"HERMES_PUSH_GATEWAY_URL": "http://127.0.0.1:9/#frag", "HERMES_PUSH_GATEWAY_TOKEN": "secret-token-value"})
+        with self.assertRaises(ConnectionError) as caught:
+            await self.connected(self.gateway())
+        self.assertNotIn("secret-token-value", str(caught.exception))
+        # A header whose value echoes the query (a redirect's Location).
+        header = websockets.exceptions.InvalidHeader("Location", "wss://gateway.example/api/ws?ticket=secret-ticket&x=1")
+        self.assertNotIn("secret-ticket", hermes_push.describe_error(header))
+        self.assertEqual(hermes_push._scrub("ws://h/api/ws?a=1&token=abc def"), "ws://h/api/ws?a=1&token=*** def")
+
+    # 5
+    async def test_a_token_with_url_characters_arrives_whole(self) -> None:
+        token = "a#b&c=d+e%f g"
+        port, fake = await self.serve(accepts=None)
+        self.own_home({"HERMES_PUSH_GATEWAY_URL": f"http://127.0.0.1:{port}", "HERMES_PUSH_GATEWAY_TOKEN": token})
+        await self.connected(self.gateway())
+        self.assertEqual(fake.tokens, [token])
+
+    # 6
+    async def test_a_refused_sign_in_says_why(self) -> None:
+        self.own_home({"HERMES_PUSH_GATEWAY_URL": "http://127.0.0.1:9", "HERMES_PUSH_GATEWAY_BEARER": "old-bearer",
+                       "HERMES_PUSH_GATEWAY_REFRESH_TOKEN": "old-refresh"})
+        Rest(self, lambda req: (401, b'{"error": "session_expired"}'))
+        with self.assertRaises(ConnectionError) as caught:
+            await self.connected(self.gateway())
+        # The words the app's rule matches, exactly, and why it can happen.
+        self.assertIn("sign-in rejected", str(caught.exception))
+        self.assertIn("A Hermes update can end every sign-in once.", str(caught.exception))
+
+    # 17
+    async def test_cloudflare_blocking_the_ticket_names_the_access_token(self) -> None:
+        self.own_home({"HERMES_PUSH_GATEWAY_URL": "https://gateway.example.test", "HERMES_PUSH_GATEWAY_BEARER": "a-bearer"})
+        Rest(self, lambda req: (403, b"<html><title>Access denied | Cloudflare</title></html>"))
+        with self.assertRaises(ConnectionError) as caught:
+            await self.connected(self.gateway())
+        # The Access hint reaches the status whole, not read as nothing listening.
+        self.assertIn("Cloudflare blocked it: the companion needs the Access service token", str(caught.exception))
+        self.assertNotIn("connection refused", str(caught.exception))
+
+    def relay(self, home_conf: dict[str, str] | None = None):
+        self.own_home(home_conf or {"HERMES_PUSH_GATEWAY_URL": "http://127.0.0.1:9", "HERMES_PUSH_GATEWAY_TOKEN": "t"})
+        relay = hermes_push.Relay()
+        relay.pushes = []
+        relay.settled = []
+        relay.open_approvals, relay.la_usage, relay.la_phase = {}, {}, {}
+        relay._turn_pushed_at, relay._finish_pushed = {}, {}
+        relay.push_all = lambda kind, title, body, meta, **k: relay.pushes.append((kind, title, body))
+        relay.update_live_activities = lambda *a, **k: set()
+        relay.end_live_activities = lambda *a, **k: None
+        return relay
+
+    # 7
+    async def test_an_approval_event_pushes_once(self) -> None:
+        relay = self.relay()
+        ev = {"type": "approval.request", "session_id": "s1", "payload": {"prompt_id": "p1", "command": "rm -rf build", "description": "Delete the build folder"}}
+        relay.on_event(ev)
+        relay.on_event(ev)
+        self.assertEqual([p[0] for p in relay.pushes], ["approval"], "the event didn't push, or pushed twice")
+        self.assertIn("Delete the build folder", relay.pushes[0][2])
+        self.assertEqual(relay.open_approvals["p1"]["req"], "p1")
+        # The server request for the same prompt: not pushed again.
+        relay.handle_request("s1", "p1", "approval", {"command": "rm -rf build", "request_id": "p1"})
+        self.assertEqual(len(relay.pushes), 1)
+
+    # 8
+    async def test_a_question_event_pushes_once(self) -> None:
+        relay = self.relay()
+        ev = {"type": "clarify.request", "session_id": "s1", "payload": {"prompt_id": "q1", "question": "Which branch?"}}
+        relay.on_event(ev)
+        relay.on_event(ev)
+        self.assertEqual([p[0] for p in relay.pushes], ["clarify"], "the event didn't push, or pushed twice")
+        self.assertIn("Which branch?", relay.pushes[0][2])
+        relay.handle_request("s1", "q1", "clarify", {"question": "Which branch?"})
+        self.assertEqual(len(relay.pushes), 1)
+
+    # 9
+    async def test_a_settled_event_settles_the_banner(self) -> None:
+        relay = self.relay()
+        relay.settle_approval = lambda rid, why="answered": (relay.open_approvals.pop(rid, None), relay.settled.append((rid, why)))
+        for rid in ("p1", "p2"):
+            relay.on_event({"type": "approval.request", "session_id": "s1", "payload": {"prompt_id": rid, "command": "ls"}})
+        answers = hermes_push.answers_dir()
+        answers.mkdir(parents=True, exist_ok=True)
+        (answers / "p2.json").write_text(json.dumps({"device_id": "phone-1", "at": time.time()}), encoding="utf-8")
+        relay.on_event({"type": "approval.settled", "session_id": "s1", "payload": {"prompt_id": "p1", "execution_generation": 2}})
+        relay.on_event({"type": "approval.settled", "session_id": "s1", "payload": {"prompt_id": "p2", "execution_generation": 2}})
+        self.assertEqual(relay.settled, [("p1", "withdrawn"), ("p2", "answered")])
+        self.assertNotIn("p1", relay.notified)
+
+    # 10
+    async def test_a_sudo_request_still_pushes(self) -> None:
+        relay = self.relay()
+        relay.handle_request("s1", "sudo-1", "sudo", {"prompt": "Password for sudo"})
+        self.assertEqual([p[0] for p in relay.pushes], ["clarify"])
+        self.assertIn("input needed", relay.pushes[0][1])
+
+    # 11
+    async def test_a_failed_turn_pushes_as_failed(self) -> None:
+        relay = self.relay()
+
+        async def no_thread(sid, a):
+            return []
+
+        relay._recent_thread = no_thread
+        relay.attached = {"s1": {"title": "Nightly", "stored": "st-1", "bot": "Hermes"},
+                          "s2": {"title": "Export", "stored": "st-2", "bot": "Hermes"}}
+        await relay._finish_turn("s1", relay.attached["s1"], {"status": "error", "text": "", "failure_reason": "gateway_connection"})
+        kind, title, body = relay.pushes[-1]
+        self.assertEqual(kind, "error")
+        self.assertIn("turn failed", title)
+        self.assertIn("The turn failed.", body)
+        self.assertNotIn("gateway_connection", body, "a code was shown")
+        # A failed turn that left its own words is pushed as those words, as before.
+        await relay._finish_turn("s2", relay.attached["s2"], {"status": "error", "text": "Error: the compute host stopped"})
+        kind, _, body = relay.pushes[-1]
+        self.assertEqual(kind, "turn")
+        self.assertIn("Error: the compute host stopped", body)
+
+    # 12
+    async def test_the_title_follows_session_info(self) -> None:
+        relay = self.relay()
+        relay.attached = {"s1": {"title": "Old", "stored": "st-1"}}
+        relay.on_event({"type": "session.info", "session_id": "s1", "payload": {"title": "New"}})
+        self.assertEqual(relay.attached["s1"]["title"], "New")
+        relay.on_event({"type": "session.info", "session_id": "s1", "payload": {"running": False}})
+        self.assertEqual(relay.attached["s1"]["title"], "New")
+
+    # 13
+    async def test_new_code_is_picked_up_while_cut_off(self) -> None:
+        relay = self.relay()
+
+        async def refused() -> None:
+            raise ConnectionError("http://127.0.0.1:9: connection refused (nothing listens there on this machine)")
+
+        async def nothing() -> None:
+            return None
+
+        relay.gw = types.SimpleNamespace(connect=refused, close=nothing, public_url="http://127.0.0.1:9", transport="", server_requests=None)
+        relay._status = lambda **fields: None
+        asked = [0]
+        real = hermes_push.code_changed
+
+        def code_changed() -> bool:
+            asked[0] += 1
+            return asked[0] > 1   # the code is replaced once the relay is cut off
+
+        hermes_push.code_changed = code_changed
+        self.addCleanup(setattr, hermes_push, "code_changed", real)
+        with self.assertRaises(hermes_push.CodeChanged):
+            await asyncio.wait_for(relay.run(), timeout=5)
+
+    # 14
+    async def test_a_refused_token_on_another_host_never_opens_the_file(self) -> None:
+        for url in ("http://192.0.2.10:9129", "http://127.0.0.1.example.test:9129", "http://localhost.example.test:9129"):
+            with self.subTest(url=url):
+                webapp = webapp_token()
+                home = self.own_home({"HERMES_PUSH_GATEWAY_URL": url, "HERMES_PUSH_GATEWAY_TOKEN": "configured-token"})
+                path = self.write_webapp_token(home, webapp)
+                reads = self.count_reads(path)
+                rest = Rest(self, takes(webapp))
+                gw = hermes_push.Gateway()
+                with self.assertRaises(Exception):
+                    gw._http("GET", "/api/status")
+                try:
+                    address, _ = gw._ws_for(gw.url)   # the socket's address only: nothing is opened
+                except Exception:  # noqa: BLE001
+                    address = ""
+                self.assertEqual(reads[0], 0, "the Webapp token's file was opened")
+                self.assertNotIn(webapp, rest.tokens)
+                self.assertNotIn(webapp, address)
+
+    # 15
+    async def test_a_refused_token_on_loopback_uses_the_file(self) -> None:
+        for url in ("http://127.0.0.1:9129", "http://localhost:9129", "http://[::1]:9129"):
+            with self.subTest(url=url):
+                webapp = webapp_token()
+                home = self.own_home({"HERMES_PUSH_GATEWAY_URL": url, "HERMES_PUSH_GATEWAY_TOKEN": "configured-token"})
+                path = self.write_webapp_token(home, webapp)
+                reads = self.count_reads(path)
+                Rest(self, takes(webapp))
+                gw = hermes_push.Gateway()
+                self.assertEqual(gw._http("GET", "/api/status"), {"ok": True})
+                address, how = gw._ws_for(gw.url)
+                self.assertIn("token=" + urllib.parse.quote(webapp, safe=""), address)
+                self.assertEqual(how, "Webapp session token")
+                self.assertEqual(reads[0], 2, "the file wasn't read at each use")
+
+    # 16
+    async def test_a_conf_change_clears_the_refusal(self) -> None:
+        home = self.own_home({"HERMES_PUSH_GATEWAY_URL": "http://127.0.0.1:9", "HERMES_PUSH_GATEWAY_TOKEN": "old-token"})
+        reads = self.count_reads(home / "webapp" / "session-token")
+        Rest(self, takes("new-working-token"))
+        gw = hermes_push.Gateway()
+        with self.assertRaises(RuntimeError):
+            gw._http("GET", "/api/status")
+        self.assertTrue(gw.token_refused)
+        # The app writes the conf again with a working token; the relay builds a new Gateway from it (_reload_config).
+        (home / "push" / "hermes-push.conf").write_text("HERMES_PUSH_GATEWAY_URL=http://127.0.0.1:9\nHERMES_PUSH_GATEWAY_TOKEN=new-working-token\n",
+                                                       encoding="utf-8")
+        hermes_push._CONF.clear()
+        hermes_push._load_conf()
+        reads[0] = 0
+        gw = hermes_push.Gateway()
+        self.assertFalse(gw.token_refused)
+        self.assertEqual(gw._http("GET", "/api/status"), {"ok": True})
+        self.assertEqual(reads[0], 0, "the Webapp token's file was read after the conf change")

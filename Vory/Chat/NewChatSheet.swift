@@ -206,6 +206,8 @@ struct NewChatSheet: View {
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.hidden)
+        // The chat it starts opens under it while it closes: a question about that chat's model waits until it's gone.
+        .modelConfirmationCover()
         .onAppear {
             focus = .to
             if draft == nil { draft = .draft(runtime: runtime, profile: nil) }

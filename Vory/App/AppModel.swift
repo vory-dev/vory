@@ -364,7 +364,10 @@ final class AppModel {
         // iCloud change forgot: it can once the phone is unlocked. Coming to the front reads
         // them too (VoryApp).
         NotificationCenter.default.addObserver(forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.store.remembered.reload() }
+            Task { @MainActor in
+                self?.store.remembered.reload()
+                await self?.gatewaysReadable()
+            }
         }
         // A runtime started away (a launch in the background) is in front once the app is.
         AwayAtLaunch.clearOnActive { [weak self] in self?.runtime }
@@ -373,9 +376,27 @@ final class AppModel {
         // background could find the App Store unable to answer, and the rows stayed away).
         Task { [weak self] in await self?.testBuildFlag.refresh() }
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in await self?.testBuildFlag.refresh() }
+            Task { @MainActor in
+                await self?.testBuildFlag.refresh()
+                // A saved list a launch couldn't read for another reason than the lock, tried again in front.
+                await self?.gatewaysReadable()
+            }
+        }
+        #elseif os(macOS)
+        // The Mac's Keychain is open with the session, so a list it couldn't read is tried again each time the app comes
+        // forward, not left on the waiting screen until a relaunch.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in await self?.gatewaysReadable() }
         }
         #endif
+    }
+
+    /// The saved gateways read again, once the Keychain can be read after a launch that couldn't (a phone still locked
+    /// after a restart): then iCloud's pass runs and the gateway in use connects, as at a launch.
+    func gatewaysReadable() async {
+        guard store.reloadIfUnreadable() else { return }
+        CloudSync.shared.syncNow()
+        await activateSavedConnection()
     }
 
     var hasConnections: Bool { !store.connections.isEmpty || store.demo != nil }

@@ -54,7 +54,7 @@ except ImportError as exc:  # pragma: no cover
 log = logging.getLogger("hermes-push")
 
 # Keep in step with plugin/vory-push/plugin.yaml; the app compares the two.
-VERSION = "1.0.40"
+VERSION = "1.0.41"
 USER_AGENT = f"Vory-Push/{VERSION} (Hermes companion)"
 try:
     # Fingerprint of the code actually running: the app compares it with the copy it ships, so a
@@ -286,6 +286,28 @@ def devices_dir() -> Path:
     return home / "push" / "devices"
 
 
+def webapp_token_path() -> Path:
+    """The Webapp's session token, which a gateway after Hermes's update signs its own browser in with."""
+    home = Path(env("HERMES_HOME") or Path.home() / ".hermes")
+    return home / "webapp" / "session-token"
+
+
+#: Hermes's own form of a Webapp session token.
+_WEBAPP_TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
+#: The only hosts whose refusal is answered with this machine's Webapp token, by the URL's literal host.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+#: What the app shows when the configured session token was refused and this machine's Webapp token can't stand in.
+#: ("rejected", not "refused": describe_error reads "refused" as nothing listening.)
+REFUSED_SESSION_TOKEN = "the gateway rejected the companion's session token: set the companion up again from the app's Companion screen"
+
+_CREDENTIAL_IN_URL = re.compile(r"([?&](?:token|ticket)=)[^&\s'\"<>]*")
+
+
+def _scrub(text) -> str:
+    """Strip credentials from error text."""
+    return _CREDENTIAL_IN_URL.sub(r"\1***", str(text))
+
+
 _dup_devices_logged: set = set()
 
 
@@ -477,7 +499,7 @@ def describe_error(exc: BaseException) -> str:
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if status:
         return f"WebSocket rejected with HTTP {status}"
-    return text.strip("<>")[:160]
+    return _scrub(text.strip("<>"))[:160]
 
 
 class ConfigChanged(Exception):
@@ -567,6 +589,10 @@ class Gateway:
             self.headers["Authorization"] = f"Bearer {self.bearer}"
         elif self.token:
             self.headers["X-Hermes-Session-Token"] = self.token
+        #: The configured session token was refused (a 401, or a 4401 close). From then on each request and each
+        #: connect reads this machine's Webapp token, for a loopback URL only. A conf change builds a new Gateway.
+        self.token_refused = False
+        self._said_webapp = False
         self.ws = None
         #: Whether the gateway took client.capabilities (None until connected): an older Hermes
         #: does not know it, and runs on without it (#400).
@@ -575,10 +601,44 @@ class Gateway:
         self._pending: dict[int, asyncio.Future] = {}
         self.events: asyncio.Queue = asyncio.Queue()
 
+    def _note_refused(self) -> None:
+        """The configured session token was refused: a 401, or a 4401 close."""
+        if self.token and not self.bearer:
+            self.token_refused = True
+
+    def _loopback(self) -> bool:
+        """Whether the configured URL's host is literally loopback: no lookup, and no "is this address mine"."""
+        try:
+            return (urllib.parse.urlsplit(self.url).hostname or "") in _LOOPBACK_HOSTS
+        except ValueError:
+            return False
+
+    def _session_token(self) -> str:
+        """The session token to send now: the configured one, or once it's been refused, this machine's Webapp token,
+        read from its file at this moment, and only for a loopback URL. Never kept, written or logged."""
+        if not self.token_refused:
+            return self.token
+        if not self._loopback():
+            raise RuntimeError(REFUSED_SESSION_TOKEN)
+        path = webapp_token_path()
+        try:
+            webapp = path.read_text(encoding="utf-8-sig").strip()
+        except (OSError, UnicodeError):
+            raise RuntimeError(REFUSED_SESSION_TOKEN) from None
+        if not _WEBAPP_TOKEN.fullmatch(webapp) or webapp == self.token:
+            raise RuntimeError(REFUSED_SESSION_TOKEN)
+        if not self._said_webapp:
+            log.warning("the gateway refused the configured session token; using the one in %s", path)
+            self._said_webapp = True
+        return webapp
+
     def _http(self, method: str, path: str, body: dict | None = None, *, _retry: bool = True) -> dict:
         import urllib.error
         import urllib.request
-        req = urllib.request.Request(self.url + path, method=method, headers={**self.headers, "Accept": "application/json", "Content-Type": "application/json"},
+        headers = {**self.headers, "Accept": "application/json", "Content-Type": "application/json"}
+        if self.token_refused:
+            headers["X-Hermes-Session-Token"] = self._session_token()
+        req = urllib.request.Request(self.url + path, method=method, headers=headers,
                                      data=json.dumps(body).encode() if body is not None else None)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
@@ -586,6 +646,12 @@ class Gateway:
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and _retry and self.refresh_token and self.refresh():
                 return self._http(method, path, body, _retry=False)
+            if exc.code == 401 and self.token and not self.bearer:
+                # Once with this machine's Webapp token; a refusal of that one too says to set the companion up again.
+                if _retry and not self.token_refused:
+                    self._note_refused()
+                    return self._http(method, path, body, _retry=False)
+                raise RuntimeError(REFUSED_SESSION_TOKEN) from None
             raise
 
     def refresh(self) -> bool:
@@ -599,7 +665,7 @@ class Gateway:
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = json.loads(r.read().decode())
         except Exception as exc:  # noqa: BLE001
-            log.warning("token refresh failed: %s", exc)
+            log.warning("token refresh failed: %s", _scrub(exc))
             return False
         access = data.get("access_token") or ""
         if not access:
@@ -616,28 +682,33 @@ class Gateway:
     def _ws_for(self, base: str) -> tuple[str, str]:
         """WebSocket URL (with credential) for one base URL, plus how it authenticates. ``self.url``
         must already be ``base`` so the ticket request goes to the same place."""
+        import urllib.error
         scheme = "wss" if base.startswith("https") else "ws"
         ws_base = scheme + base[base.index("://"):] + "/api/ws"
         if self.bearer:
-            import urllib.error
             try:
                 ticket = self._http("POST", "/api/auth/ws-ticket", {})["ticket"]
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", "replace")[:300].lower()
-                hint = " (Cloudflare refused it: the companion needs the Access service token, or use a loopback URL)" if "cloudflare" in body or "cf-" in body \
-                    else " (sign-in rejected: sign in for the companion again)" if exc.code in (401, 403) else ""
+                hint = " (Cloudflare blocked it: the companion needs the Access service token, or use a loopback URL)" if "cloudflare" in body or "cf-" in body \
+                    else " (sign-in rejected: sign in for the companion again. A Hermes update can end every sign-in once.)" if exc.code in (401, 403) else ""
                 raise RuntimeError(f"HTTP {exc.code} {exc.reason}{hint}") from None
             except urllib.error.URLError as exc:
                 raise RuntimeError(describe_error(exc)) from None
-            return f"{ws_base}?ticket={ticket}", "companion bearer"
-        return f"{ws_base}?token={self.token}", "session token"
+            return f"{ws_base}?ticket={urllib.parse.quote(ticket, safe='')}", "companion bearer"
+        token = self._session_token()
+        how = "Webapp session token" if self.token_refused else "session token"
+        return f"{ws_base}?token={urllib.parse.quote(token, safe='')}", how
 
-    async def connect(self) -> None:
-        """Connect to the configured URL; the error says what that URL answered, for the app."""
+    async def connect(self, *, _again: bool = True) -> None:
+        """Connect to the configured URL; the error says what that URL answered, for the app. A refused session token
+        (the upgrade answered 401, or the socket closed 4401) is tried once more at once, with this machine's Webapp
+        token (`_session_token`)."""
         # A reconnect replaces the socket: the one before it is closed, or it stays open, still
         # attached to every session it mirrored (so the gateway never reaps them), still pinged,
         # and its reader still feeding events into the queue next to the new one's.
         await self.close()
+        refused_before = self.token_refused
         try:
             ready, how = await asyncio.to_thread(self._ws_for, self.url)
             kwargs = {"additional_headers": {k: v for k, v in self.headers.items() if not k.startswith("Authorization") and k != "X-Hermes-Session-Token"},
@@ -645,6 +716,10 @@ class Gateway:
             # A hung upgrade (tunnel, half-open socket) must not freeze the relay without a heartbeat.
             self.ws = await asyncio.wait_for(websockets.connect(ready, **kwargs), timeout=30)
         except Exception as exc:  # noqa: BLE001
+            if getattr(getattr(exc, "response", None), "status_code", None) == 401:
+                self._note_refused()
+            if _again and self.token_refused and not refused_before:
+                return await self.connect(_again=False)
             raise ConnectionError(f"{self.url}: {describe_error(exc)}") from None
         self.transport = f"{self.url} ({how})"
         asyncio.create_task(self._reader(self.ws))
@@ -659,6 +734,15 @@ class Gateway:
             await self.call("client.capabilities", {"server_requests": True})
             self.server_requests = True
         except Exception as exc:  # noqa: BLE001
+            # Closed 4401 after the accept: the gateway refused the session token.
+            if getattr(self.ws, "close_code", None) == 4401:
+                self._note_refused()
+                if _again and self.token_refused and not refused_before:
+                    # The refused socket's reader has put its "closed" already: it isn't news for the next socket.
+                    self.events = asyncio.Queue()
+                    return await self.connect(_again=False)
+                if self.token_refused:
+                    raise ConnectionError(f"{self.url}: {REFUSED_SESSION_TOKEN}") from None
             if not is_unknown_method(exc):
                 raise
             if self.server_requests is not False:
@@ -701,12 +785,19 @@ class Gateway:
                         # the relay loop as a request event.
                         await self.events.put({"type": "__request__", "id": msg["id"], "method": msg["method"], "params": msg.get("params") or {}})
         except Exception as exc:  # noqa: BLE001
-            log.warning("ws reader ended: %s", exc)
+            log.warning("ws reader ended: %s", _scrub(exc))
         # Only the current socket's end is news. A socket released on purpose (ReleaseIdle, a
         # config reload) finishes closing after its replacement is up; its "closed" read as the
         # new socket's made the relay reconnect again without closing that one, leaking one
         # healthy, attached socket per idle release (every 10 min by default).
         if ws is self.ws:
+            if getattr(ws, "close_code", None) == 4401:
+                # The session token was refused: a call waiting on this socket fails now, not at its timeout.
+                self._note_refused()
+                for fut in self._pending.values():
+                    if not fut.done():
+                        fut.set_exception(ConnectionError("socket closed 4401"))
+                self._pending.clear()
             await self.events.put({"type": "__closed__"})
 
     async def call(self, method: str, params: dict | None = None, timeout: float = 60) -> dict:
@@ -1399,6 +1490,9 @@ class Relay:
         self._conf_loaded = conf_mtime()
         while True:
             try:
+                # New code on disk is taken before a connect too, so a relay that can't connect still updates.
+                if code_changed():
+                    raise CodeChanged()
                 if conf_mtime() != self._conf_loaded:
                     log.info("hermes-push.conf changed; reloading")
                     await self._reload_config()
@@ -1465,12 +1559,12 @@ class Relay:
                 self._status(connected=False, gateway=self.gw.public_url, transport=self.gw.transport, error="reloading new code…")
                 raise
             except Exception as exc:  # noqa: BLE001
-                log.warning("disconnected: %s; retrying in %ss", exc, backoff)
-                self._status(connected=False, gateway=self.gw.public_url, transport=self.gw.transport, error=str(exc)[:400])
-                # Back off, but wake early when the app drops a new config in.
+                log.warning("disconnected: %s; retrying in %ss", _scrub(exc), backoff)
+                self._status(connected=False, gateway=self.gw.public_url, transport=self.gw.transport, error=_scrub(exc)[:400])
+                # Back off, but wake early when the app drops a new config in, or new code.
                 for _ in range(backoff):
                     await asyncio.sleep(1)
-                    if conf_mtime() != self._conf_loaded:
+                    if conf_mtime() != self._conf_loaded or code_changed():
                         break
                 backoff = min(30, backoff * 2)
 
@@ -1499,7 +1593,9 @@ class Relay:
         window (long-press) shows `text` in full, the chat under `title`, and the exchanges that led
         up to it (`thread`, fetched here with a short timeout)."""
         title = a["title"]; bot = a.get("bot") or a.get("profile", "Hermes")
-        err = p.get("error")
+        # After Hermes's update a failed turn sends no error string: status "error" and an empty text. Its codes are
+        # never shown; a failed turn that left its own words is pushed as those words, as before.
+        err = p.get("error") or ("The turn failed." if p.get("status") == "error" and not str(p.get("text") or "").strip() else None)
         stored = str(a.get("stored", sid))
         fkey = (stored, hashlib.sha1((str(p.get("text") or "") + str(err or "")).encode("utf-8", "replace")).hexdigest())
         now = time.time()
@@ -1624,7 +1720,15 @@ class Relay:
             # ends the phone's Live Activity and sends the alert.
             asyncio.create_task(self._attach_then_handle(sid, ev))
             return
-        if kind == "session.title" and a:
+        # After Hermes's update an approval and a question come as events, keyed by prompt_id (the request id the
+        # pending rows carry). `notified` keys them and the server requests alike, so one prompt pushes once.
+        if kind == "approval.request" and (rid := str(p.get("prompt_id") or "")):
+            self.handle_request(sid, rid, "approval", {**p, "request_id": rid})
+            return
+        if kind == "clarify.request" and (rid := str(p.get("prompt_id") or "")):
+            self.handle_request(sid, rid, "clarify", p)
+            return
+        if kind in ("session.title", "session.info") and a:
             a["title"] = p.get("title") or a["title"]
         elif kind == "message.complete" and a:
             self.la_phase.pop(sid, None)
@@ -1637,10 +1741,13 @@ class Relay:
             asyncio.create_task(self._finish_turn(sid, a, p))
         elif kind == "error" and a:
             self.push_all("error", f"{a.get('bot') or a.get('profile', 'Hermes')} · error", f"{a['title']}: {str(p.get('message', ''))[:180]}", self.meta(sid), collapse=f"err-{sid}")
-        elif kind == "request.cancel":
-            self.notified.discard(p.get("id", ""))
-            if p.get("id", "") in self.open_approvals:
-                self.settle_approval(p.get("id", ""), "withdrawn")
+        elif kind in ("request.cancel", "approval.settled", "clarify.settled"):
+            # A server request withdrawn (`id`), or an approval or question settled after Hermes's update (`prompt_id`).
+            rid = p.get("id", "") if kind == "request.cancel" else str(p.get("prompt_id") or "")
+            self.notified.discard(rid)
+            if rid in self.open_approvals:
+                answered = kind != "request.cancel" and approval_answered_by(rid, self.open_approvals[rid]["req"])
+                self.settle_approval(rid, "answered" if answered else "withdrawn")
             # The ask was answered (from the phone, or elsewhere): the Live Activity stops asking.
             if a and self.la_phase.get(sid):
                 phase = self.la_phase[sid][0]

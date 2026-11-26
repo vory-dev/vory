@@ -305,7 +305,7 @@ struct GatewayFormView: View {
                         .textContentType(.oneTimeCode).autocorrectionDisabled()
                         .accessibilityIdentifier("gateway.sessionToken")
                         .focused($field, equals: .token)
-                    Text("The dashboard's HERMES_DASHBOARD_SESSION_TOKEN. Used when the gateway has no auth gate (loopback / trusted network).")
+                    Text("The dashboard's HERMES_DASHBOARD_SESSION_TOKEN, or after a Hermes update, the token in ~/.hermes/webapp/session-token on the gateway machine. Used when the gateway has no auth gate (loopback / trusted network).")
                         .font(.footnote).foregroundStyle(.secondary)
                 case .password:
                     providerPicker

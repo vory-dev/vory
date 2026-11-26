@@ -7,8 +7,16 @@ import Observation
 public final class ConnectionStore {
     private static let indexAccount = "connections.index"
     private static let activeKey = "activeConnectionID"
+    /// The gateways the person removed here, until the iCloud pass takes the removal (`removedHere`).
+    private static let removedKey = "connections.removedHere"
+    /// The bytes of a saved list that couldn't be decoded, kept aside; nothing reads them back.
+    private static let setAsideAccount = "connections.index.undecodable"
 
     public private(set) var connections: [GatewayConnection] = []
+    /// The saved list couldn't be read: the Keychain answered with something other than the list or "no item" (a phone
+    /// still locked after a restart). Not "no gateways": nothing writes the list while this is set, and
+    /// `reloadIfUnreadable()` reads it again.
+    public private(set) var isUnreadable = false
     /// Sign-ins the person asked this device to remember, behind Face ID or the passcode. Apart
     /// from `secrets(for:)`, so nothing that copies those (iCloud, the watch) ever sees them.
     /// Opened on first use, so a process that never asks (the extensions) never reads it.
@@ -40,7 +48,41 @@ public final class ConnectionStore {
     public func leaveDemo() { demo = nil }
 
     public convenience init() {
-        self.init(defaults: .standard, connections: Keychain.getCodable([GatewayConnection].self, account: Self.indexAccount) ?? [])
+        let saved = Self.loadIndex(defaults: .standard)
+        self.init(defaults: .standard, connections: saved.list, unreadable: saved.unreadable)
+    }
+
+    /// The saved list, or unreadable: the Keychain couldn't be read. A list it holds that can't be decoded isn't a lock
+    /// (waiting won't change it): its bytes go aside, kept from the first time, and the list starts empty; what iCloud's
+    /// pass remembers pushing is forgotten too, so a gateway added now doesn't make the pass take every old one for
+    /// removed here.
+    private static func loadIndex(defaults: UserDefaults) -> (list: [GatewayConnection], unreadable: Bool) {
+        switch Keychain.read(account: indexAccount) {
+        case .absent: return ([], false)
+        case .unreadable: return ([], true)
+        case .data(let data):
+            if let list = try? JSONDecoder().decode([GatewayConnection].self, from: data) { return (list, false) }
+            if Keychain.read(account: setAsideAccount) == .absent { try? Keychain.set(data, account: setAsideAccount) }
+            GatewaySyncMemory.forget(in: defaults)
+            return ([], false)
+        }
+    }
+
+    /// Reads the saved list again after a read that couldn't be made. The app calls it when the phone's protected data
+    /// becomes available. True when the list came back.
+    @discardableResult
+    public func reloadIfUnreadable() -> Bool {
+        guard isUnreadable else { return false }
+        let saved = Self.loadIndex(defaults: defaults)
+        guard !saved.unreadable else { return false }
+        connections = saved.list
+        isUnreadable = false
+        if let s = defaults.string(forKey: Self.activeKey), let id = UUID(uuidString: s), saved.list.contains(where: { $0.id == id }) {
+            savedActiveID = id
+        } else {
+            savedActiveID = saved.list.first?.id
+        }
+        return true
     }
 
     /// A store with the demo in it and nothing else, for a demo that is not the app's gateway in use (onboarding's tour,
@@ -52,11 +94,14 @@ public final class ConnectionStore {
         return store
     }
 
-    /// The saved list as read, and the defaults the gateway in use is kept in (tests give their own).
-    init(defaults: UserDefaults, connections: [GatewayConnection], keepsNothing: Bool = false) {
+    /// The saved list as read, and the defaults the gateway in use is kept in (tests give their own). An unreadable list
+    /// leaves the gateway in use as the defaults have it: setting it here would write it away.
+    init(defaults: UserDefaults, connections: [GatewayConnection], keepsNothing: Bool = false, unreadable: Bool = false) {
         self.defaults = defaults
         self.connections = connections
         self.keepsNothing = keepsNothing
+        self.isUnreadable = unreadable
+        if unreadable { return }
         if !keepsNothing, let s = defaults.string(forKey: Self.activeKey), let id = UUID(uuidString: s), connections.contains(where: { $0.id == id }) {
             savedActiveID = id
         } else {
@@ -74,6 +119,8 @@ public final class ConnectionStore {
     public func upsert(_ connection: GatewayConnection, secrets: GatewaySecrets) throws {
         // The demo is never saved, nor anything in a store that keeps nothing.
         guard !connection.isDemo, !keepsNothing else { return }
+        // Saved now, the list would be this one gateway, over the ones the Keychain couldn't give back.
+        guard !isUnreadable else { throw ConnectionStoreError.listUnreadable }
         var c = connection
         c.hasAccessHeaders = secrets.access.isConfigured
         // Write the Keychain first so a failure leaves the in-memory list untouched.
@@ -109,19 +156,65 @@ public final class ConnectionStore {
 
     public func delete(id: UUID) {
         if id == GatewayConnection.demoID { demo = nil; return }
-        guard !keepsNothing else { return }
+        guard !keepsNothing, !isUnreadable else { return }
         connections.removeAll { $0.id == id }
         Keychain.delete(account: secretsAccount(id))
         // A sign-in remembered for it goes with it (a delete needs no Face ID).
         remembered.forget(id)
         try? persistIndex()
         if savedActiveID == id { savedActiveID = connections.first?.id }
+        // Kept until the iCloud pass takes it: a removal the person made is the only way every gateway may leave the
+        // iCloud copy at once.
+        defaults.set((removedHere.map(\.uuidString) + [id.uuidString]).sorted(), forKey: Self.removedKey)
+    }
+
+    /// The gateways the person removed here that the iCloud pass hasn't taken yet.
+    public var removedHere: Set<UUID> {
+        Set((defaults.stringArray(forKey: Self.removedKey) ?? []).compactMap(UUID.init(uuidString:)))
+    }
+
+    /// The iCloud pass took these removals.
+    public func forgetRemoved(_ ids: Set<UUID>) {
+        guard !keepsNothing else { return }
+        let left = removedHere.subtracting(ids)
+        defaults.set(left.isEmpty ? nil : left.map(\.uuidString).sorted(), forKey: Self.removedKey)
     }
 
     private func secretsAccount(_ id: UUID) -> String { "secrets." + id.uuidString }
 
     private func persistIndex() throws {
-        guard !keepsNothing else { return }
+        guard !keepsNothing, !isUnreadable else { return }
         try Keychain.setCodable(connections, account: Self.indexAccount)
+    }
+}
+
+/// What iCloud's gateway pass remembers in the defaults (`CloudGateways`): the gateways this device pushed, and when
+/// each last agreed with the iCloud copy.
+public enum GatewaySyncMemory {
+    public static let knownKey = "cloudSync.knownGateways"
+    public static let stampsKey = "cloudSync.gatewayStamps"
+    public static let seenKey = "cloudSync.gatewaySeen"
+
+    /// Forgets the pushed gateways, and their stamps: the pass then takes none of them for removed here.
+    public static func forget(in defaults: UserDefaults) {
+        let ids = defaults.stringArray(forKey: knownKey) ?? []
+        for key in [stampsKey, seenKey] {
+            guard var entries = defaults.dictionary(forKey: key) else { continue }
+            for id in ids { entries[id] = nil }
+            defaults.set(entries, forKey: key)
+        }
+        defaults.removeObject(forKey: knownKey)
+    }
+}
+
+/// A write the store refused.
+public enum ConnectionStoreError: LocalizedError, Sendable {
+    /// The saved list couldn't be read (a phone still locked after a restart): saving now would replace it.
+    case listUnreadable
+
+    public var errorDescription: String? {
+        switch self {
+        case .listUnreadable: "Your saved gateways can't be read until this device is unlocked. Unlock it and try again."
+        }
     }
 }

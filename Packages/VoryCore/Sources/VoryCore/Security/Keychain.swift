@@ -24,6 +24,9 @@ public enum Keychain {
     /// The demo copy of the app (its own bundle id, ad-hoc signed) has no Keychain it may use:
     /// items live in memory for the life of the process instead. Never set in a release build.
     nonisolated(unsafe) public static var memoryOnly = false
+    /// Tests only: every device-only read answers as if the Keychain had returned this status, as a phone that is still
+    /// locked after a restart does (errSecInteractionNotAllowed). Nil reads normally.
+    nonisolated(unsafe) public static var forcedReadStatus: OSStatus?
     nonisolated(unsafe) private static var memory: [String: Data] = [:]
     private static let memoryLock = NSLock()
     /// Reads, writes (a value) or removes (nil) an in-memory item; returns what is there after.
@@ -72,15 +75,36 @@ public enum Keychain {
         }
     }
 
-    public static func get(account: String) -> Data? {
+    /// What a read found: the item, no item, or a Keychain that couldn't be read.
+    public enum Read: Equatable, Sendable {
+        case data(Data)
+        case absent
+        case unreadable(OSStatus)
+    }
+
+    /// The item, or why there is none. Absent only when the Keychain says it isn't there (errSecItemNotFound); any other
+    /// failure (a phone still locked after a restart answers errSecInteractionNotAllowed) is unreadable, never "none".
+    public static func read(account: String) -> Read {
         #if DEBUG
-        if memoryOnly { return inMemory(account) }
+        if let s = forcedReadStatus { return s == errSecItemNotFound ? .absent : .unreadable(s) }
+        if memoryOnly { return inMemory(account).map(Read.data) ?? .absent }
         #endif
         var q = base(account)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: AnyObject?
-        return SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess ? out as? Data : nil
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        switch status {
+        case errSecSuccess: return (out as? Data).map(Read.data) ?? .unreadable(errSecDecode)
+        case errSecItemNotFound: return .absent
+        default: return .unreadable(status)
+        }
+    }
+
+    /// The item's data, for a caller to whom "unreadable" and "absent" are the same.
+    public static func get(account: String) -> Data? {
+        if case .data(let d) = read(account: account) { return d }
+        return nil
     }
 
     public static func delete(account: String) {
@@ -112,13 +136,39 @@ public enum Keychain {
                                               kSecMatchLimit as String: kSecMatchLimitAll])
         var out: AnyObject?
         guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let items = out as? [[String: Any]] else { return }
-        for item in items where (item[kSecAttrAccessGroup as String] as? String) != group {
+        for item in items {
             guard let account = item[kSecAttrAccount as String] as? String, let data = item[kSecValueData as String] as? Data else { continue }
-            if (try? set(data, account: account)) != nil {
-                var old: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
-                if let g = item[kSecAttrAccessGroup as String] as? String { old[kSecAttrAccessGroup as String] = g }
-                SecItemDelete(dataProtected(old) as CFDictionary)
+            let oldGroup = item[kSecAttrAccessGroup as String] as? String
+            switch migrationStep(oldGroup: oldGroup, group: group, inGroup: read(account: account)) {
+            case .leave: continue
+            case .deleteOld: break
+            case .copyThenDeleteOld: guard (try? set(data, account: account)) != nil else { continue }
             }
+            // The step is never a delete without the old item's own group, so this matches the old item alone.
+            guard let oldGroup else { continue }
+            let old: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                      kSecAttrAccount as String: account, kSecAttrAccessGroup as String: oldGroup]
+            SecItemDelete(dataProtected(old) as CFDictionary)
+        }
+    }
+
+    /// What the migration does with one item it found.
+    public enum MigrationStep: Equatable, Sendable {
+        case leave
+        case deleteOld
+        case copyThenDeleteOld
+    }
+
+    /// The migration's choice for one item. Left: an item already in the group; an item whose group the Keychain didn't
+    /// return (a delete without its group would match the shared copy too); an item whose shared copy can't be read.
+    /// When the shared copy is there, it is the one every read finds, so only the old one goes. When it is absent, the
+    /// old one is copied in first, and goes only once the copy is written.
+    public static func migrationStep(oldGroup: String?, group: String, inGroup: Read) -> MigrationStep {
+        guard let oldGroup, oldGroup != group else { return .leave }
+        switch inGroup {
+        case .data: return .deleteOld
+        case .absent: return .copyThenDeleteOld
+        case .unreadable: return .leave
         }
     }
 

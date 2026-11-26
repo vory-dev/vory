@@ -31,7 +31,7 @@ struct TroubleshootingView: View {
             "Nginx Proxy Manager with Block Common Exploits on used to reject the sign-in request; the app now encodes it fully. If a proxy still answers 403, check its rules for the /api path.",
             "The browser closed without handing the app its code: the gateway's callback must reach \(DeviceWords.this). A dashboard that only listens on the gateway machine cannot call back over the internet.",
             "Username and password only works on a gateway that offers password sign-in. A browser-only gateway says so in the test; use the browser there.",
-            "Session token: copy HERMES_DASHBOARD_SESSION_TOKEN from the gateway's environment. It is refused when the gateway has its auth gate on.",
+            "Session token: copy HERMES_DASHBOARD_SESSION_TOKEN from the gateway's environment, or after a Hermes update, the token in ~/.hermes/webapp/session-token on the gateway machine. It is refused when the gateway has its auth gate on.",
         ]),
         Topic(id: "companion", title: "The Companion will not install or restart", symbol: "puzzlepiece.extension", checks: [
             "Install writes files through the dashboard's file API. If it fails, the signed-in account needs permission to write under the profile's home.",
@@ -39,6 +39,7 @@ struct TroubleshootingView: View {
             "If the restart says the session expired, the app renews it once and tries again. If it still fails, sign in again from the card; if Settings › Companion already shows it running, the restart happened.",
             "After a restart, the gateway must be able to start the plugin: run hermes serve by hand once and read its output if the Companion never reports in.",
             "Update the Companion from Settings › Software Update whenever a build asks for it; old versions miss newer features.",
+            "After a Hermes update, sign in again here first. Then, in Settings › Companion, sign the companion in again if it has its own sign-in, and install it again.",
         ]),
         Topic(id: "push", title: DeviceWords.isMac ? "No notifications" : "No notifications or Live Activity", symbol: "bell.slash", checks: [
             "Settings › Companion › This device must show the relay registered and the device file published. Register again if either is missing.",

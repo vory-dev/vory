@@ -4,7 +4,13 @@ public struct RPCError: Error, Hashable, Sendable, LocalizedError {
     public var code: Int
     public var message: String
     public var data: JSONValue?
-    public var errorDescription: String? { message }
+    public var errorDescription: String? {
+        // A call naming a bot this gateway doesn't serve, which Hermes's session authority refuses before any handler.
+        if reason == "profile_mismatch" { return "This gateway doesn't run that bot. Its own bots still work here." }
+        return message
+    }
+    /// The refusal's reason: the gateway's `data.reason` when it sends one, else the message.
+    public var reason: String { data?["reason"]?.stringValue ?? message }
 
     public static let methodNotFound = -32601
 

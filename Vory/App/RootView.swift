@@ -59,7 +59,12 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
-            if !model.hasConnections || Self.forceTour || Self.forceWelcome {
+            if model.store.isUnreadable {
+                // The saved gateways can't be read yet (a phone still locked after a restart). Not the first-run tour,
+                // whose first gateway would be saved over them.
+                ContentUnavailableView("Waiting for Unlock", systemImage: "lock",
+                                       description: Text("Vory reads your saved gateways once \(DeviceWords.this) is unlocked."))
+            } else if !model.hasConnections || Self.forceTour || Self.forceWelcome {
                 OnboardingView(skipWelcome: Self.forceTour)
             } else {
                 MainTabView()

@@ -378,9 +378,9 @@ struct RoomCard: View {
 enum GroupChats {
     static func create(runtime: GatewayRuntime, name: String, profiles: [ProfileInfo]) async throws -> Room {
         // The gateway does not mint room ids: the client sends one (a string, letters/digits/-._:).
-        let roomID = "room-" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10)).lowercased()
+        let roomID = GroupCreate.newRoomID()
         let list: [JSONValue] = profiles.prefix(6).map { .object(["member_id": .string($0.name), "handle": .string($0.name), "profile": .string($0.name), "display_name": .string($0.label)]) }
-        let r = try await runtime.rpc("groups.create", ["room_id": .string(roomID), "name": .string(String(name.prefix(200))), "members": .array(list)])
+        let r = try await runtime.rpc("groups.create", GroupCreate.params(name: String(name.prefix(200)), members: list, roomID: roomID))
         // Gateways answer in different shapes (the room, {room}, or an id only); the room list is
         // the one source that always has the full record, so the new room is taken from there.
         let createdID = r["room_id"]?.stringValue ?? r["room"]?["room_id"]?.stringValue ?? r["id"]?.stringValue ?? roomID
@@ -449,7 +449,7 @@ struct NewRoomSheet: View {
             .object(["member_id": .string($0.name), "handle": .string($0.name), "profile": .string($0.name), "display_name": .string($0.label)])
         }
         do {
-            _ = try await runtime.rpc("groups.create", ["name": .string(name.trimmingCharacters(in: .whitespaces)), "members": .array(list)])
+            _ = try await runtime.rpc("groups.create", GroupCreate.params(name: name.trimmingCharacters(in: .whitespaces), members: list))
             await onCreated()
             dismiss()
         } catch { self.error = error.localizedDescription }

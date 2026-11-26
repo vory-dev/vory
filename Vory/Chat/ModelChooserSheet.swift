@@ -23,6 +23,8 @@ struct ModelChooserSheet: View {
     @State private var error: String?
     @State private var query = ""
     @State private var favourites = FavouriteModels.shared
+    /// A pick on its way to the gateway: the rows wait for its answer.
+    @State private var busy = false
     /// When the sheet was made, for the perf log's "ready in" (DEBUG).
     @State private var madeAt = DispatchTime.now()
 
@@ -80,6 +82,8 @@ struct ModelChooserSheet: View {
             }
             .accessibilityIdentifier("models.sheet")
         }
+        // A pick the gateway asks about is asked here, over the list: the chat or the bot card under it can't present it.
+        .modelConfirmationHost(chat, in: .sheet, onUse: { dismiss() })
         .task { await load(refresh: false) }
         .onAppear { Perf.stamp("models: list appeared, \(Self.ms(since: madeAt)) ms after it was made") }
         // How long a keystroke takes to be drawn: the filter and the list's update, to the next turn of the main loop.
@@ -124,7 +128,7 @@ struct ModelChooserSheet: View {
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            .disabled(!offered)
+            .disabled(!offered || busy)
             if current { Image(systemName: "checkmark").foregroundStyle(.tint).accessibilityHidden(true) }
             Button { withAnimation(.snappy) { favourites.toggle(f, gateway) } } label: {
                 Image(systemName: isFav ? "star.fill" : "star").foregroundStyle(isFav ? AnyShapeStyle(.yellow) : AnyShapeStyle(.secondary))
@@ -144,11 +148,15 @@ struct ModelChooserSheet: View {
     }
 
     private func pick(_ f: FavouriteModel) {
+        guard !busy else { return }
+        busy = true
         Task {
             do { try await chat.setModel(provider: f.provider, model: f.model) }
             catch { chat.banner = error.localizedDescription }
+            busy = false
+            // The gateway asks first: the list stays for its question. Use closes it; Cancel leaves the list up.
+            if chat.pendingModelConfirmation == nil { dismiss() }
         }
-        dismiss()
     }
 
     private func load(refresh: Bool) async {

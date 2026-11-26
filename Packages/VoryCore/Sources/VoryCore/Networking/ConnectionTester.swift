@@ -28,6 +28,10 @@ public struct ConnectionTestOutcome: Sendable {
 
 /// Runs the three-leg test the desktop performs: `/api/status` JSON, an authenticated call, and a live `/api/ws` upgrade.
 public enum ConnectionTester {
+    /// The gateway setting a failed socket's hints name, in one place: after Hermes's update the gateway reads
+    /// webapp.public_url, which the update copies from dashboard.public_url when unset.
+    static let publicURLHint = "dashboard.public_url (or webapp.public_url after a Hermes update)"
+
     public static func run(connection: GatewayConnection, secrets: GatewaySecrets, progress: @Sendable @escaping ([ConnectionTestStep]) -> Void) async -> ConnectionTestOutcome {
         var steps = [
             ConnectionTestStep(id: "status", title: "GET /api/status returns JSON"),
@@ -64,14 +68,18 @@ public enum ConnectionTester {
                 update(1, .passed("Signed in as \(me.displayName ?? me.email ?? me.userId ?? "user") via \(me.provider ?? "provider")"))
             } else {
                 if connection.authMode.usesBearer {
-                    update(1, .failed("This gateway has no auth gate; it expects the dashboard session token (HERMES_DASHBOARD_SESSION_TOKEN). Switch the auth mode to “Session token”."))
+                    update(1, .failed("This gateway has no auth gate; it expects the dashboard session token (HERMES_DASHBOARD_SESSION_TOKEN), or after a Hermes update, the token in ~/.hermes/webapp/session-token. Switch the auth mode to “Session token”."))
                     return ConnectionTestOutcome(steps: steps, version: version, authRequired: authRequired)
                 }
                 let profiles: ProfilesResponse = try await api.get("/api/profiles")
                 update(1, .passed("Session token accepted; \(profiles.profiles.count) profile(s)"))
             }
         } catch {
-            update(1, .failed(error.localizedDescription))
+            if !connection.authMode.usesBearer, (error as? HermesAPIError)?.isUnauthorized == true {
+                update(1, .failed(ConnectProblem.sessionTokenRefused))
+            } else {
+                update(1, .failed(error.localizedDescription))
+            }
             return ConnectionTestOutcome(steps: steps, version: version, authRequired: authRequired)
         }
 
@@ -86,8 +94,13 @@ public enum ConnectionTester {
             let result = try await probeWebSocket(url: url, headers: signer.publicHeaders)
             update(2, .passed(result))
         } catch {
-            let hint = " HTTP works but the WebSocket failed: check that your reverse proxy or Cloudflare tunnel forwards Upgrade requests to /api/ws, that Access (if any) receives the same service-token headers, and that the gateway's dashboard.public_url matches this host."
-            update(2, .failed(error.localizedDescription + hint))
+            if !connection.authMode.usesBearer, case .closed(let code, _)? = error as? SocketError, code == 4401 {
+                // A refused token, not a proxy's trouble with upgrades: the token's own words, without the proxy hint.
+                update(2, .failed(ConnectProblem.sessionTokenRefused))
+            } else {
+                let hint = " HTTP works but the WebSocket failed: check that your reverse proxy or Cloudflare tunnel forwards Upgrade requests to /api/ws, that Access (if any) receives the same service-token headers, and that the gateway's \(publicURLHint) matches this host."
+                update(2, .failed(error.localizedDescription + hint))
+            }
         }
         return ConnectionTestOutcome(steps: steps, version: version, authRequired: authRequired)
     }
@@ -120,7 +133,7 @@ public enum ConnectionTester {
                     let reason = task.closeReason.map { String(decoding: $0, as: UTF8.self) } ?? ""
                     switch code {
                     case 4401: throw SocketError.closed(code: code, reason: "credential rejected (\(reason))")
-                    case 4403: throw SocketError.closed(code: code, reason: "host/origin guard (\(reason)); set dashboard.public_url to this URL")
+                    case 4403: throw SocketError.closed(code: code, reason: "host/origin guard (\(reason)); set \(publicURLHint) to this URL")
                     case 4408: throw SocketError.closed(code: code, reason: "peer not allowed (loopback-only bind)")
                     default:
                         if code > 0 { throw SocketError.closed(code: code, reason: reason) }

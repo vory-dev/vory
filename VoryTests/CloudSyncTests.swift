@@ -355,13 +355,17 @@ struct CloudGatewayTests {
         var forgotten: [UUID] = []
         /// The device's remembered sign-ins, for a test that follows one into the vault.
         var vault: RememberedSignInVault?
+        /// The gateways removed here that the pass hasn't taken yet, as the app's store keeps them.
+        var removedHere: Set<UUID> = []
+        func forgetRemoved(_ ids: Set<UUID>) { removedHere.subtract(ids) }
         func connection(id: UUID) -> GatewayConnection? { connections.first { $0.id == id } }
         func secrets(for id: UUID) -> GatewaySecrets { secretsByID[id] ?? GatewaySecrets() }
         func upsert(_ connection: GatewayConnection, secrets: GatewaySecrets) throws {
             if let i = connections.firstIndex(where: { $0.id == connection.id }) { connections[i] = connection } else { connections.append(connection) }
             secretsByID[connection.id] = secrets
         }
-        func remove(_ id: UUID) { connections.removeAll { $0.id == id }; secretsByID[id] = nil }
+        /// The person removing a gateway here, as Settings' Remove does.
+        func remove(_ id: UUID) { connections.removeAll { $0.id == id }; secretsByID[id] = nil; removedHere.insert(id) }
         func forgetRememberedSignIn(_ id: UUID) { forgotten.append(id); vault?.forget(id) }
     }
 

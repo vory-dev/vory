@@ -116,12 +116,17 @@ public struct GatewayURL: Hashable, Codable, Sendable, CustomStringConvertible {
         return items.map { enc($0.name) + ($0.value.map { "=" + enc($0) } ?? "") }.joined(separator: "&")
     }
 
-    /// `ws(s)://host[:port]<prefix><path>?<query>`
-    public func websocket(_ path: String, query: [URLQueryItem] = []) -> URL {
+    /// `ws(s)://host[:port]<prefix><path>?<query>[&<credential>]`. The credential (a token or a ticket) comes last,
+    /// encoded down to RFC 3986 unreserved characters as every REST query is, so any character in it arrives whole.
+    public func websocket(_ path: String, query: [URLQueryItem] = [], credential: URLQueryItem? = nil) -> URL {
         var comps = URLComponents(url: base, resolvingAgainstBaseURL: false)!
         comps.scheme = isTLS ? "wss" : "ws"
         comps.path = pathPrefix + (path.hasPrefix("/") ? path : "/" + path)
         comps.queryItems = query.isEmpty ? nil : query
+        if let credential {
+            let c = Self.encodedQuery([credential])
+            comps.percentEncodedQuery = comps.percentEncodedQuery.map { $0 + "&" + c } ?? c
+        }
         return comps.url!
     }
 }

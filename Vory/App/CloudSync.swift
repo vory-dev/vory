@@ -489,6 +489,18 @@ protocol GatewayStoring: AnyObject {
     /// A merge while the device is locked cannot delete it: it is no longer offered, and is
     /// deleted once the device is unlocked (see `RememberedSignInVault.pendingForgets`).
     func forgetRememberedSignIn(_ id: UUID)
+    /// The saved list couldn't be read: the pass leaves everything as it is.
+    var isUnreadable: Bool { get }
+    /// The gateways the person removed here that the pass hasn't taken yet.
+    var removedHere: Set<UUID> { get }
+    /// The pass took these removals.
+    func forgetRemoved(_ ids: Set<UUID>)
+}
+
+extension GatewayStoring {
+    var isUnreadable: Bool { false }
+    var removedHere: Set<UUID> { [] }
+    func forgetRemoved(_ ids: Set<UUID>) {}
 }
 
 extension ConnectionStore: GatewayStoring {
@@ -498,9 +510,10 @@ extension ConnectionStore: GatewayStoring {
 @MainActor
 enum CloudGateways {
     static let account = "gateways"
-    static let knownKey = "cloudSync.knownGateways"
-    static let stampsKey = "cloudSync.gatewayStamps"
-    static let seenKey = "cloudSync.gatewaySeen"
+    // The pass's memory, kept beside the saved list (which forgets it when its list can't be decoded).
+    static let knownKey = GatewaySyncMemory.knownKey
+    static let stampsKey = GatewaySyncMemory.stampsKey
+    static let seenKey = GatewaySyncMemory.seenKey
 
     /// What a pass did. `changed` are gateways this device already had whose setup came down.
     struct Outcome: Equatable {
@@ -544,9 +557,13 @@ enum CloudGateways {
     /// - A gateway removed here leaves the cloud and is remembered as removed.
     /// - `importNew`: gateways only the cloud has are added here. Off for a device that has
     ///   none yet, where bringing them in is Restore's job.
+    /// - A saved list that couldn't be read: nothing at all, not even the memory of what was pushed.
+    /// - No gateway here, and the device had pushed some: only the ones the person removed here leave the cloud. An
+    ///   empty list is otherwise taken for one that hasn't come back yet, never for "removed them all".
     @discardableResult
     static func reconcile(store: any GatewayStoring, importNew: Bool, storage: Storage = .keychain,
                           defaults: UserDefaults = .standard, now: Double = Date().timeIntervalSince1970) -> Outcome {
+        guard !store.isUnreadable else { return Outcome() }
         var file = storage.load()
         let before = file
         var out = Outcome()
@@ -609,13 +626,18 @@ enum CloudGateways {
             }
         }
 
-        // Had it, pushed it, and it is gone now: removed here.
+        // Had it, pushed it, and it is gone now: removed here. With none left here, only the person's own removals.
         let localIDs = Set(store.connections.map(\.id.uuidString))
-        for id in known.subtracting(localIDs) {
+        let gone = known.subtracting(localIDs)
+        let removedHere = Set(store.removedHere.map(\.uuidString))
+        let removed = localIDs.isEmpty ? gone.intersection(removedHere) : gone
+        for id in removed {
             file.gateways.removeAll { $0.connection.id.uuidString == id }
             file.deleted[id] = now
             stamps[id] = nil; seen[id] = nil
         }
+        // Each removal the person made is settled now: taken above, or never pushed.
+        store.forgetRemoved(store.removedHere)
 
         if importNew {
             let addresses = Set(store.connections.map(address))
@@ -669,6 +691,8 @@ enum CloudAlternates {
     @discardableResult
     static func reconcile(store: any GatewayStoring, storage: Storage = .keychain, listedIDs: Set<String>? = nil,
                           defaults: UserDefaults = .standard, now: Double = Date().timeIntervalSince1970) -> [UUID] {
+        // A saved list that couldn't be read: no backup is taken as gone.
+        guard !store.isUnreadable else { return [] }
         var file = storage.load()
         let before = file
         var changed: [UUID] = []

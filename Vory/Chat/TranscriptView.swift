@@ -527,9 +527,9 @@ struct TranscriptView: View {
                     .padding(.trailing, 16).padding(.bottom, dockReach + 12)
                 }
             }
-            .sheet(item: $selectText) { SelectTextSheet(title: $0.title, text: $0.text, monospaced: $0.monospaced).sheetFrame(.wide).withAppModel() }
+            .sheet(item: $selectText) { SelectTextSheet(title: $0.title, text: $0.text, monospaced: $0.monospaced).sheetFrame(.wide).withAppModel().modelConfirmationCover() }
             .sheet(isPresented: $showModelSheet) { ModelSheet(chat: chat).sheetFrame().withAppModel() }
-            .sheet(isPresented: $showAwayGrace) { AwayGraceSheet(runtime: chat.runtime).sheetFrame(.compact).withAppModel() }
+            .sheet(isPresented: $showAwayGrace) { AwayGraceSheet(runtime: chat.runtime).sheetFrame(.compact).withAppModel().modelConfirmationCover() }
             #if os(iOS)
             // Under the status bar, behind the floating header. The Mac's toolbar is not a place to run under.
             .ignoresSafeArea(.container, edges: .top)
@@ -4762,7 +4762,7 @@ struct MarkdownTableView: View {
         // No menu of its own: a long press keeps the reply's (Reply, Speak, Copy, Share). The
         // corner button opens the table, and its sheet copies it as Markdown.
         // Local, as the html card's is: the row stays alive under its sheet in the lazy thread.
-        .sheet(isPresented: $full) { MarkdownTableSheet(table: table).sheetFrame(.wide).withAppModel() }
+        .sheet(isPresented: $full) { MarkdownTableSheet(table: table).sheetFrame(.wide).withAppModel().modelConfirmationCover() }
     }
 
     private var grid: some View {
@@ -5031,7 +5031,7 @@ struct ToolCardView: View {
             // In place from the start; the card's moving edge reveals and covers it (nothing slides).
             .folded(open: expanded, spacing: compact ? 4 : 6)
         }
-        .sheet(isPresented: $showFull) { ToolCallSheet(activity: activity, fullCall: fullCall).sheetFrame(.wide).withAppModel() }
+        .sheet(isPresented: $showFull) { ToolCallSheet(activity: activity, fullCall: fullCall).sheetFrame(.wide).withAppModel().modelConfirmationCover() }
         .padding(compact ? 8 : 12)
         .frame(maxWidth: .infinity, alignment: .leading)
         // A painted card, not glass: a thread can hold dozens of these, and each live glass
